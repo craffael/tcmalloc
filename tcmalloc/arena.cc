@@ -14,6 +14,8 @@
 
 #include "tcmalloc/arena.h"
 
+#include <new>
+
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/static_vars.h"
 #include "tcmalloc/system-alloc.h"
@@ -22,13 +24,12 @@ GOOGLE_MALLOC_SECTION_BEGIN
 namespace tcmalloc {
 namespace tcmalloc_internal {
 
-void* Arena::Alloc(size_t bytes, int alignment) {
-  ASSERT(alignment > 0);
+void* Arena::Alloc(size_t bytes, std::align_val_t alignment) {
+  size_t align = static_cast<size_t>(alignment);
+  ASSERT(align > 0);
   {  // First we need to move up to the correct alignment.
-    const int misalignment =
-        reinterpret_cast<uintptr_t>(free_area_) % alignment;
-    const int alignment_bytes =
-        misalignment != 0 ? alignment - misalignment : 0;
+    const int misalignment = reinterpret_cast<uintptr_t>(free_area_) % align;
+    const int alignment_bytes = misalignment != 0 ? align - misalignment : 0;
     free_area_ += alignment_bytes;
     free_avail_ -= alignment_bytes;
     bytes_allocated_ += alignment_bytes;
@@ -36,7 +37,6 @@ void* Arena::Alloc(size_t bytes, int alignment) {
   char* result;
   if (free_avail_ < bytes) {
     size_t ask = bytes > kAllocIncrement ? bytes : kAllocIncrement;
-    size_t actual_size;
     // TODO(b/171081864): Arena allocations should be made relatively
     // infrequently.  Consider tagging this memory with sampled objects which
     // are also infrequently allocated.
@@ -46,14 +46,15 @@ void* Arena::Alloc(size_t bytes, int alignment) {
     // single partition we choose might only contain nodes that the process is
     // unable to allocate from due to cgroup restrictions.
     MemoryTag tag;
-    const auto& numa_topology = Static::numa_topology();
+    const auto& numa_topology = tc_globals.numa_topology();
     if (numa_topology.numa_aware()) {
       tag = NumaNormalTag(numa_topology.GetCurrentPartition());
     } else {
       tag = MemoryTag::kNormal;
     }
-    free_area_ =
-        reinterpret_cast<char*>(SystemAlloc(ask, &actual_size, kPageSize, tag));
+
+    auto [ptr, actual_size] = SystemAlloc(ask, kPageSize, tag);
+    free_area_ = reinterpret_cast<char*>(ptr);
     if (ABSL_PREDICT_FALSE(free_area_ == nullptr)) {
       Crash(kCrash, __FILE__, __LINE__,
             "FATAL ERROR: Out of memory trying to allocate internal tcmalloc "
@@ -71,7 +72,7 @@ void* Arena::Alloc(size_t bytes, int alignment) {
     free_avail_ = actual_size;
   }
 
-  ASSERT(reinterpret_cast<uintptr_t>(free_area_) % alignment == 0);
+  ASSERT(reinterpret_cast<uintptr_t>(free_area_) % align == 0);
   result = free_area_;
   free_area_ += bytes;
   free_avail_ -= bytes;

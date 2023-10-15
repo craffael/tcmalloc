@@ -29,19 +29,22 @@
 #include <utility>
 #include <vector>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/random/random.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/optional.h"
 #include "absl/types/span.h"
 #include "tcmalloc/internal/logging.h"
+#include "tcmalloc/internal/percpu.h"
 
 namespace tcmalloc {
 namespace tcmalloc_internal {
 namespace {
 
-int memfd_create(const char *name, unsigned int flags) {
+int memfd_create(const char* name, unsigned int flags) {
 #ifdef __NR_memfd_create
   return syscall(__NR_memfd_create, name, flags);
 #else
@@ -67,13 +70,13 @@ class SyntheticCpuList {
 
   // Disallow copies, which would make require reference counting to know when
   // we should close fd_.
-  SyntheticCpuList(const SyntheticCpuList &) = delete;
-  SyntheticCpuList &operator=(const SyntheticCpuList &) = delete;
+  SyntheticCpuList(const SyntheticCpuList&) = delete;
+  SyntheticCpuList& operator=(const SyntheticCpuList&) = delete;
 
   // Moves are fine - only one instance at a time holds the fd.
-  SyntheticCpuList(SyntheticCpuList &&other)
+  SyntheticCpuList(SyntheticCpuList&& other)
       : fd_(std::exchange(other.fd_, -1)) {}
-  SyntheticCpuList &operator=(SyntheticCpuList &&other) {
+  SyntheticCpuList& operator=(SyntheticCpuList&& other) {
     new (this) SyntheticCpuList(std::move(other));
     return *this;
   }
@@ -172,6 +175,26 @@ TEST_F(NumaTopologyTest, TwoNode) {
   }
 }
 
+// Confirm that an empty node parses correctly (b/212827142).
+TEST_F(NumaTopologyTest, EmptyNode) {
+  std::vector<SyntheticCpuList> nodes;
+  nodes.emplace_back("0-5");
+  nodes.emplace_back("");
+  nodes.emplace_back("6-11");
+
+  const auto nt = CreateNumaTopology<3>(nodes);
+
+  EXPECT_EQ(nt.numa_aware(), true);
+  EXPECT_EQ(nt.active_partitions(), 3);
+
+  for (int cpu = 0; cpu <= 5; cpu++) {
+    EXPECT_EQ(nt.GetCpuPartition(cpu), 0);
+  }
+  for (int cpu = 6; cpu <= 11; cpu++) {
+    EXPECT_EQ(nt.GetCpuPartition(cpu), 2);
+  }
+}
+
 // Test that cpulists too long to fit into the 16 byte buffer used by
 // InitNumaTopology() parse successfully.
 TEST_F(NumaTopologyTest, LongCpuLists) {
@@ -216,67 +239,6 @@ TEST_F(NumaTopologyTest, Host) {
 
   // We don't actually know anything about the host, so there's not much more
   // we can do beyond checking that we didn't crash.
-}
-
-// Ensure that we can parse randomized cpulists correctly.
-TEST(ParseCpulistTest, Random) {
-  absl::BitGen gen;
-
-  static constexpr int kIterations = 100;
-  for (int i = 0; i < kIterations; i++) {
-    cpu_set_t reference;
-    CPU_ZERO(&reference);
-
-    // Set a random number of CPUs within the reference set.
-    const double density = absl::Uniform(gen, 0.0, 1.0);
-    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
-      if (absl::Bernoulli(gen, density)) {
-        CPU_SET(cpu, &reference);
-      }
-    }
-
-    // Serialize the reference set into a cpulist-style string.
-    std::vector<std::string> components;
-    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
-      if (!CPU_ISSET(cpu, &reference)) continue;
-
-      const int start = cpu;
-      int next = cpu + 1;
-      while (next < CPU_SETSIZE && CPU_ISSET(next, &reference)) {
-        cpu = next;
-        next = cpu + 1;
-      }
-
-      if (cpu == start) {
-        components.push_back(absl::StrCat(cpu));
-      } else {
-        components.push_back(absl::StrCat(start, "-", cpu));
-      }
-    }
-    const std::string serialized = absl::StrJoin(components, ",");
-
-    // Now parse that string using our ParseCpulist function, randomizing the
-    // amount of data we provide to it from each read.
-    absl::string_view remaining(serialized);
-    const cpu_set_t parsed =
-        ParseCpulist([&](char *const buf, const size_t count) -> ssize_t {
-          // Calculate how much data we have left to provide.
-          const size_t max = std::min(count, remaining.size());
-
-          // If none, we have no choice but to provide nothing.
-          if (max == 0) return 0;
-
-          // If we do have data, return a randomly sized subset of it to stress
-          // the logic around reading partial values.
-          const size_t copy = absl::Uniform(gen, static_cast<size_t>(1), max);
-          memcpy(buf, remaining.data(), copy);
-          remaining.remove_prefix(copy);
-          return copy;
-        });
-
-    // We ought to have parsed the same set of CPUs that we serialized.
-    EXPECT_TRUE(CPU_EQUAL(&parsed, &reference));
-  }
 }
 
 }  // namespace

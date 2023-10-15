@@ -16,13 +16,32 @@
 //
 // An allocation policy encapsulates four policies:
 //
+// - Size returning policy
+//   Manages the return type and contents of returned pointer values.
+//
+//   struct SizeReturningPolicyTemplate {
+//     // The type to return. E.g: void* or size_ptr_t.
+//     using pointer_type = <pointer type>;
+//
+//     // Returns true if this policy includes sizes information.
+//     static constexpr bool size_returning();
+//
+//     // Returns a pointer from the provide raw pointer and size information.
+//     static pointer_type as_pointer(void* ptr, size_t capacity);
+//
+//     // Returns a pointer based on the provide raw pointer and size class.
+//     static pointer_type to_pointer(void* ptr, size_t size_class);
+//   };
+//
 // - Out of memory policy.
 //   Dictates how to handle OOM conditions.
 //
 //   struct OomPolicyTemplate {
-//     // Invoked when we failed to allocate memory
-//     // Must either terminate, throw, or return nullptr
-//     static void* handle_oom(size_t size);
+//     // Invoked when we failed to allocate memory.
+//     // This method is templated on a size returning policy documented above.
+//     // Must either terminate, throw, or return nullptr.
+//     template <typename Policy>
+//     static Policy::pointer_type handle_oom(size_t size);
 //   };
 //
 // - Alignment policy
@@ -72,6 +91,7 @@
 #include "tcmalloc/internal/numa.h"
 #include "tcmalloc/internal/percpu.h"
 #include "tcmalloc/new_extension.h"
+#include "tcmalloc/sizemap.h"
 #include "tcmalloc/static_vars.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
@@ -80,16 +100,20 @@ namespace tcmalloc_internal {
 
 // NullOomPolicy: returns nullptr
 struct NullOomPolicy {
-  static inline constexpr void* handle_oom(size_t size) { return nullptr; }
+  template <typename Policy, typename Pointer = typename Policy::pointer_type>
+  static inline constexpr Pointer handle_oom(size_t size) {
+    return Policy::as_pointer(nullptr, 0);
+  }
 
   static constexpr bool can_return_nullptr() { return true; }
 };
 
 // MallocOomPolicy: sets errno to ENOMEM and returns nullptr
 struct MallocOomPolicy {
-  static inline void* handle_oom(size_t size) {
+  template <typename Policy, typename Pointer = typename Policy::pointer_type>
+  static inline Pointer handle_oom(size_t size) {
     errno = ENOMEM;
-    return nullptr;
+    return Policy::as_pointer(nullptr, 0);
   }
 
   static constexpr bool can_return_nullptr() { return true; }
@@ -97,8 +121,9 @@ struct MallocOomPolicy {
 
 // CppOomPolicy: terminates the program
 struct CppOomPolicy {
-  static ABSL_ATTRIBUTE_NOINLINE ABSL_ATTRIBUTE_NORETURN void* handle_oom(
-      size_t size) {
+  template <typename Policy, typename Pointer = typename Policy::pointer_type>
+  static ABSL_ATTRIBUTE_NOINLINE ABSL_ATTRIBUTE_NORETURN Pointer
+  handle_oom(size_t size) {
     Crash(kCrashWithStats, __FILE__, __LINE__,
           "Unable to allocate (new failed)", size);
     __builtin_unreachable();
@@ -135,15 +160,28 @@ class AlignAsPolicy {
   size_t value_;
 };
 
+// AllocationAccessAsPolicy: use user provided access hint
+class AllocationAccessAsPolicy {
+ public:
+  AllocationAccessAsPolicy() = delete;
+  explicit constexpr AllocationAccessAsPolicy(hot_cold_t value)
+      : value_(value) {}
+
+  constexpr hot_cold_t access() const { return value_; }
+
+ private:
+  hot_cold_t value_;
+};
+
 struct AllocationAccessHotPolicy {
-  // Important: the value here is explicitly kHot to allow the value to be
-  // constant propagated.  This allows allocations without a hot/cold hint to
-  // use the normal fast path.
-  static constexpr AllocationAccess access() { return AllocationAccess::kHot; }
+  // Important: the value here is explicitly hot_cold_t{255} to allow the value
+  // to be constant propagated.  This allows allocations without a hot/cold hint
+  // to use the normal fast path.
+  static constexpr hot_cold_t access() { return hot_cold_t{255}; }
 };
 
 struct AllocationAccessColdPolicy {
-  static constexpr AllocationAccess access() { return AllocationAccess::kCold; }
+  static constexpr hot_cold_t access() { return hot_cold_t{0}; }
 };
 
 using DefaultAllocationAccessPolicy = AllocationAccessHotPolicy;
@@ -156,6 +194,32 @@ struct InvokeHooksPolicy {
 // NoHooksPolicy: do not invoke memory allocation hooks
 struct NoHooksPolicy {
   static constexpr bool invoke_hooks() { return false; }
+};
+
+// IsSizeReturningPolicy: Allocation returns size externally
+struct IsSizeReturningPolicy {
+  using pointer_type = sized_ptr_t;
+
+  static constexpr bool size_returning() { return true; }
+
+  static constexpr pointer_type as_pointer(void* ptr, size_t capacity) {
+    return {ptr, capacity};
+  }
+
+  static pointer_type to_pointer(void* ptr, size_t size_class) {
+    return {ptr, tc_globals.sizemap().class_to_size(size_class)};
+  }
+};
+
+// NonSizeReturningPolicy: Allocation does not return size externally
+struct NonSizeReturningPolicy {
+  using pointer_type = void*;
+
+  static constexpr bool size_returning() { return false; }
+
+  static constexpr pointer_type as_pointer(void* ptr, size_t) { return ptr; }
+
+  static pointer_type to_pointer(void* ptr, size_t) { return ptr; }
 };
 
 // Use a fixed NUMA partition.
@@ -180,10 +244,10 @@ struct LocalNumaPartitionPolicy {
   // thread migrates between NUMA nodes & partitions. Users of this function
   // should not rely upon multiple invocations returning the same partition.
   size_t partition() const {
-    return Static::numa_topology().GetCurrentPartition();
+    return tc_globals.numa_topology().GetCurrentPartition();
   }
   size_t scaled_partition() const {
-    return Static::numa_topology().GetCurrentScaledPartition();
+    return tc_globals.numa_topology().GetCurrentScaledPartition();
   }
 };
 
@@ -194,15 +258,24 @@ template <typename OomPolicy = CppOomPolicy,
           typename AlignPolicy = DefaultAlignPolicy,
           typename AccessPolicy = DefaultAllocationAccessPolicy,
           typename HooksPolicy = InvokeHooksPolicy,
+          typename SizeReturningPolicy = NonSizeReturningPolicy,
           typename NumaPolicy = LocalNumaPartitionPolicy>
 class TCMallocPolicy {
  public:
+  // Size returning / pointer type
+  using pointer_type = typename SizeReturningPolicy::pointer_type;
+
   constexpr TCMallocPolicy() = default;
   explicit constexpr TCMallocPolicy(AlignPolicy align, NumaPolicy numa)
       : align_(align), numa_(numa) {}
+  explicit constexpr TCMallocPolicy(AlignPolicy align, hot_cold_t access,
+                                    NumaPolicy numa)
+      : align_(align), access_(access), numa_(numa) {}
 
   // OOM policy
-  static void* handle_oom(size_t size) { return OomPolicy::handle_oom(size); }
+  static pointer_type handle_oom(size_t size) {
+    return OomPolicy::template handle_oom<SizeReturningPolicy>(size);
+  }
 
   // Alignment policy
   constexpr size_t align() const { return align_.align(); }
@@ -215,58 +288,88 @@ class TCMallocPolicy {
     return numa_.scaled_partition();
   }
 
-  constexpr AllocationAccess access() const { return AccessPolicy::access(); }
+  constexpr hot_cold_t access() const { return access_.access(); }
 
   // Hooks policy
   static constexpr bool invoke_hooks() { return HooksPolicy::invoke_hooks(); }
 
+  // Size returning functions
+  static constexpr bool size_returning() {
+    return SizeReturningPolicy::size_returning();
+  }
+  static pointer_type as_pointer(void* ptr, size_t capacity) {
+    return SizeReturningPolicy::as_pointer(ptr, capacity);
+  }
+  static pointer_type to_pointer(void* ptr, size_t size_class) {
+    return SizeReturningPolicy::to_pointer(ptr, size_class);
+  }
+
   // Returns this policy aligned as 'align'
   template <typename align_t>
   constexpr TCMallocPolicy<OomPolicy, AlignAsPolicy, AccessPolicy, HooksPolicy,
-                           NumaPolicy>
+                           SizeReturningPolicy, NumaPolicy>
   AlignAs(align_t align) const {
     return TCMallocPolicy<OomPolicy, AlignAsPolicy, AccessPolicy, HooksPolicy,
-                          NumaPolicy>(AlignAsPolicy{align}, numa_);
+                          SizeReturningPolicy, NumaPolicy>(AlignAsPolicy{align},
+                                                           numa_);
+  }
+
+  // Returns this policy with access hit
+  constexpr TCMallocPolicy<OomPolicy, AlignPolicy, AllocationAccessAsPolicy,
+                           HooksPolicy, SizeReturningPolicy, NumaPolicy>
+  AccessAs(hot_cold_t access) const {
+    return TCMallocPolicy<OomPolicy, AlignPolicy, AllocationAccessAsPolicy,
+                          HooksPolicy, SizeReturningPolicy, NumaPolicy>(
+        align_, access, numa_);
   }
 
   // Returns this policy for frequent access
   constexpr TCMallocPolicy<OomPolicy, AlignPolicy, AllocationAccessHotPolicy,
-                           HooksPolicy, NumaPolicy>
+                           HooksPolicy, SizeReturningPolicy, NumaPolicy>
   AccessAsHot() const {
     return TCMallocPolicy<OomPolicy, AlignPolicy, AllocationAccessHotPolicy,
-                          HooksPolicy, NumaPolicy>(align_, numa_);
+                          HooksPolicy, SizeReturningPolicy, NumaPolicy>(align_,
+                                                                        numa_);
   }
 
   // Returns this policy for infrequent access
   constexpr TCMallocPolicy<OomPolicy, AlignPolicy, AllocationAccessColdPolicy,
-                           HooksPolicy, NumaPolicy>
+                           HooksPolicy, SizeReturningPolicy, NumaPolicy>
   AccessAsCold() const {
     return TCMallocPolicy<OomPolicy, AlignPolicy, AllocationAccessColdPolicy,
-                          HooksPolicy, NumaPolicy>(align_, numa_);
+                          HooksPolicy, SizeReturningPolicy, NumaPolicy>(align_,
+                                                                        numa_);
   }
 
   // Returns this policy with a nullptr OOM policy.
   constexpr TCMallocPolicy<NullOomPolicy, AlignPolicy, AccessPolicy,
-                           HooksPolicy, NumaPolicy>
+                           HooksPolicy, SizeReturningPolicy, NumaPolicy>
   Nothrow() const {
     return TCMallocPolicy<NullOomPolicy, AlignPolicy, AccessPolicy, HooksPolicy,
-                          NumaPolicy>(align_, numa_);
+                          SizeReturningPolicy, NumaPolicy>(align_, numa_);
   }
 
   // Returns this policy with NewAllocHook invocations disabled.
   constexpr TCMallocPolicy<OomPolicy, AlignPolicy, AccessPolicy, NoHooksPolicy,
-                           NumaPolicy>
+                           SizeReturningPolicy, NumaPolicy>
   WithoutHooks() const {
     return TCMallocPolicy<OomPolicy, AlignPolicy, AccessPolicy, NoHooksPolicy,
-                          NumaPolicy>(align_, numa_);
+                          SizeReturningPolicy, NumaPolicy>(align_, numa_);
+  }
+
+  constexpr TCMallocPolicy<OomPolicy, AlignPolicy, AccessPolicy, HooksPolicy,
+                           IsSizeReturningPolicy, NumaPolicy>
+  SizeReturning() const {
+    return TCMallocPolicy<OomPolicy, AlignPolicy, AccessPolicy, HooksPolicy,
+                          IsSizeReturningPolicy, NumaPolicy>(align_, numa_);
   }
 
   // Returns this policy with a fixed NUMA partition.
   constexpr TCMallocPolicy<OomPolicy, AlignPolicy, AccessPolicy, NoHooksPolicy,
-                           FixedNumaPartitionPolicy>
+                           SizeReturningPolicy, FixedNumaPartitionPolicy>
   InNumaPartition(size_t partition) const {
     return TCMallocPolicy<OomPolicy, AlignPolicy, AccessPolicy, NoHooksPolicy,
-                          FixedNumaPartitionPolicy>(
+                          SizeReturningPolicy, FixedNumaPartitionPolicy>(
         align_, FixedNumaPartitionPolicy{partition});
   }
 
@@ -281,12 +384,14 @@ class TCMallocPolicy {
   }
 
  private:
-  AlignPolicy align_;
-  NumaPolicy numa_;
+  ABSL_ATTRIBUTE_NO_UNIQUE_ADDRESS AlignPolicy align_;
+  ABSL_ATTRIBUTE_NO_UNIQUE_ADDRESS AccessPolicy access_;
+  ABSL_ATTRIBUTE_NO_UNIQUE_ADDRESS NumaPolicy numa_;
 };
 
 using CppPolicy = TCMallocPolicy<CppOomPolicy, DefaultAlignPolicy>;
 using MallocPolicy = TCMallocPolicy<MallocOomPolicy, MallocAlignPolicy>;
+using NothrowPolicy = TCMallocPolicy<NullOomPolicy, DefaultAlignPolicy>;
 
 }  // namespace tcmalloc_internal
 }  // namespace tcmalloc

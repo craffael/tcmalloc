@@ -18,8 +18,7 @@ allocator that has the following characteristics:
 
 ## Usage
 
-You use TCMalloc by specifying it as the `malloc` attribute on your binary rules
-in Bazel.
+You use TCMalloc by specifying it as the `malloc` attribute on your binary rules in Bazel.
 
 ## Overview
 
@@ -53,9 +52,9 @@ will request a batch of memory from the middle-end to refill the cache. The
 middle-end comprises the CentralFreeList and the TransferCache.
 
 If the middle-end is exhausted, or if the requested size is greater than the
-maximum size that the front-end caches, a request will go to the back-end to
-either satisfy the large allocation, or to refill the caches in the middle-end.
-The back-end is also referred to as the PageHeap.
+maximum size that the front-end caches handle, a request will go to the back-end
+to either satisfy the large allocation, or to refill the caches in the
+middle-end. The back-end is also referred to as the PageHeap.
 
 There are two implementations of the TCMalloc front-end:
 
@@ -73,22 +72,22 @@ the implementations of malloc/new and free/delete.
 
 ## Small and Large Object Allocation
 
-Allocations of "small" objects are mapped onto to one of
+Allocations of "small" objects are mapped onto one of
 [60-80 allocatable size-classes](https://github.com/google/tcmalloc/blob/master/tcmalloc/size_classes.cc).
 For example, an allocation of 12 bytes will get rounded up to the 16 byte
 size-class. The size-classes are designed to minimize the amount of memory that
 is wasted when rounding to the next largest size-class.
 
 When compiled with `__STDCPP_DEFAULT_NEW_ALIGNMENT__ <= 8`, we use a set of
-sizes aligned to 8 bytes for raw storage allocated with `::operator new`.  This
+sizes aligned to 8 bytes for raw storage allocated with `::operator new`. This
 smaller alignment minimizes wasted memory for many common allocation sizes (24,
 40, etc.) which are otherwise rounded up to a multiple of 16 bytes. On many
 compilers, this behavior is controlled by the `-fnew-alignment=...` flag.
-When `__STDCPP_DEFAULT_NEW_ALIGNMENT__` is not
-specified (or is larger than 8 bytes), we use standard 16 byte alignments for
-`::operator new`. However, for allocations under 16 bytes, we may return an
-object with a lower alignment, as no object with a larger alignment requirement
-can be allocated in the space.
+When
+`__STDCPP_DEFAULT_NEW_ALIGNMENT__` is not specified (or is larger than 8 bytes),
+we use standard 16 byte alignments for `::operator new`. However, for
+allocations under 16 bytes, we may return an object with a lower alignment, as
+no object with a larger alignment requirement can be allocated in the space.
 
 When an object of a given size is requested, that request is mapped to a request
 of a particular size-class using the
@@ -158,15 +157,15 @@ currently cached. On average the amount actually cached should be about half the
 limit.
 
 The maximum capacity is increased when a size-class
-[runs out of objects](https://github.com/google/tcmalloc/blob/master/tcmalloc/cpu_cache.cc),
-as well as fetching more objects it considers
-[increasing the capacity](https://github.com/google/tcmalloc/blob/master/tcmalloc/cpu_cache.cc)
+[runs out of objects](https://github.com/google/tcmalloc/blob/master/tcmalloc/cpu_cache.h),
+and when fetching more objects, it also considers
+[increasing the capacity](https://github.com/google/tcmalloc/blob/master/tcmalloc/cpu_cache.h)
 of the size-class. It can increase the capacity of the size-class up until the
 total memory (for all size-classes) that the cache could hold reaches the
 per-cpu limit or until the capacity of that size-class reaches the hard-coded
 size limit for that size-class. If the size-class has not reached the hard-coded
 limit, then in order to increase the capacity it can
-[steal](https://github.com/google/tcmalloc/blob/master/tcmalloc/cpu_cache.cc)
+[steal](https://github.com/google/tcmalloc/blob/master/tcmalloc/cpu_cache.h)
 capacity from another size-class on the same CPU.
 
 ### Restartable Sequences and Per-CPU TCMalloc
@@ -185,7 +184,7 @@ itself.
 
 The practical implication of this for TCMalloc is that the code can use a
 restartable sequence like
-[TcmallocSlab_Push](https://github.com/google/tcmalloc/blob/master/tcmalloc/internal/percpu_tcmalloc.h)
+[TcmallocSlab_Internal_Push](https://github.com/google/tcmalloc/blob/master/tcmalloc/internal/percpu_tcmalloc.h)
 to fetch from or return an element to a per-CPU array without needing locking.
 The restartable sequence ensures that either the array is updated without the
 thread being interrupted, or the sequence is restarted if the thread was
@@ -250,11 +249,11 @@ sizing algorithm.
     [reduced](https://github.com/google/tcmalloc/blob/master/tcmalloc/thread_cache.cc)
     should the total size of the cached objects exceed the per-thread limit.
 *   In per-CPU mode the
-    [capacity](https://github.com/google/tcmalloc/blob/master/tcmalloc/cpu_cache.cc)
-    of the free list is increased on whether we are alternating between
-    underflows and overflows (indicating that a larger cache might stop this
-    alternation). The capacity is
-    [reduced](https://github.com/google/tcmalloc/blob/master/tcmalloc/cpu_cache.cc)
+    [capacity](https://github.com/google/tcmalloc/blob/master/tcmalloc/cpu_cache.h)
+    of the free list is increased depending on whether we are alternating
+    between underflows and overflows (indicating that a larger cache might stop
+    this alternation). The capacity is
+    [reduced](https://github.com/google/tcmalloc/blob/master/tcmalloc/cpu_cache.h)
     when it has not been grown for a time and may therefore be over capacity.
 
 ## TCMalloc Middle-end
@@ -275,9 +274,9 @@ The transfer cache holds an array of pointers to free memory, and it is quick to
 move objects into this array, or fetch objects from this array on behalf of the
 front-end.
 
-The transfer cache gets its name from situations where one thread is allocating
-memory that is deallocated by another thread. The transfer cache allows memory
-to rapidly flow between two different threads.
+The transfer cache gets its name from situations where one CPU (or thread) is
+allocating memory that is deallocated by another CPU (or thread). The transfer
+cache allows memory to rapidly flow between two different CPUs (or threads).
 
 If the transfer cache is unable to satisfy the memory request, or has
 insufficient space to hold the returned objects, it will access the central free
@@ -297,9 +296,9 @@ available objects in the spans, more spans are requested from the back-end.
 When objects are
 [returned to the central free list](https://github.com/google/tcmalloc/blob/master/tcmalloc/central_freelist.cc),
 each object is mapped to the span to which it belongs (using the
-[pagemap](#pagemap)) and then released into that span. If all the objects that
-reside in a particular span are returned to it, the entire span gets returned to
-the back-end.
+[pagemap](#pagemap-and-spans)) and then released into that span. If all the
+objects that reside in a particular span are returned to it, the entire span
+gets returned to the back-end.
 
 ### Pagemap and Spans
 
@@ -368,7 +367,7 @@ Small pages are better able to handle the memory requirements of the application
 with less overhead. For example, a half-used 4KiB page will have 2KiB left over
 versus a 32KiB page which would have 16KiB. Small pages are also more likely to
 become free. For example, a 4KiB page can hold eight 512-byte objects versus 64
-objects on a 32KiB page; and there is much less chance of 32 objects being free
+objects on a 32KiB page; and there is much less chance of 64 objects being free
 at the same time than there is of eight becoming free.
 
 Large pages result in less need to fetch and return memory from the back-end. A
@@ -456,7 +455,7 @@ metadata will grow as the heap grows. In particular the pagemap will grow with
 the virtual address range that TCMalloc uses, and the spans will grow as the
 number of active pages of memory grows. In per-CPU mode, TCMalloc will reserve a
 slab of memory per-CPU (typically 256 KiB), which, on systems with large numbers
-of logical CPUs, can lead to a multi-megabyte footprint.
+of logical CPUs, can lead to a multi-mebibyte footprint.
 
 It is worth noting that TCMalloc requests memory from the OS in large chunks
 (typically 1 GiB regions). The address space is reserved, but not backed by

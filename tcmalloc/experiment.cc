@@ -16,7 +16,13 @@
 
 #include <string.h>
 
+#include <algorithm>
+#include <string>
+
+#include "absl/base/attributes.h"
+#include "absl/base/call_once.h"
 #include "absl/base/macros.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "tcmalloc/internal/environment.h"
@@ -45,16 +51,16 @@ bool LookupExperimentID(absl::string_view label, Experiment* exp) {
 }
 
 const bool* GetSelectedExperiments() {
-  static bool by_id[kNumExperiments];
+  ABSL_CONST_INIT static bool by_id[kNumExperiments];
+  ABSL_CONST_INIT static absl::once_flag flag;
 
-  static const bool* status = [&]() {
+  absl::base_internal::LowLevelCallOnce(&flag, [&]() {
     const char* active_experiments = thread_safe_getenv(kExperiments);
     const char* disabled_experiments = thread_safe_getenv(kDisableExperiments);
-    return SelectExperiments(by_id,
-                             active_experiments ? active_experiments : "",
-                             disabled_experiments ? disabled_experiments : "");
-  }();
-  return status;
+    SelectExperiments(by_id, active_experiments ? active_experiments : "",
+                      disabled_experiments ? disabled_experiments : "");
+  });
+  return by_id;
 }
 
 template <typename F>
@@ -106,39 +112,6 @@ const bool* SelectExperiments(bool* buffer, absl::string_view active,
   return buffer;
 }
 
-void PrintExperiments(Printer* printer) {
-  // Index experiments by their positions in the experiments array, rather than
-  // by experiment ID.
-  static bool active[ABSL_ARRAYSIZE(experiments)];
-  static const bool* status = []() {
-    memset(active, 0, sizeof(active));
-    const bool* by_id = GetSelectedExperiments();
-
-    for (int i = 0; i < ABSL_ARRAYSIZE(experiments); i++) {
-      const auto& config = experiments[i];
-      active[i] = by_id[static_cast<int>(config.id)];
-    }
-
-    return active;
-  }();
-
-  printer->printf("MALLOC EXPERIMENTS:");
-  for (int i = 0; i < ABSL_ARRAYSIZE(experiments); i++) {
-    const char* value = status[i] ? "1" : "0";
-    printer->printf(" %s=%s", experiments[i].name, value);
-  }
-
-  printer->printf("\n");
-}
-
-void FillExperimentProperties(
-    std::map<std::string, MallocExtension::Property>* result) {
-  for (const auto& config : experiments) {
-    (*result)[absl::StrCat("tcmalloc.experiment.", config.name)].value =
-        IsExperimentActive(config.id) ? 1 : 0;
-  }
-}
-
 }  // namespace tcmalloc_internal
 
 bool IsExperimentActive(Experiment exp) {
@@ -156,6 +129,13 @@ absl::optional<Experiment> FindExperimentByName(absl::string_view name) {
   }
 
   return absl::nullopt;
+}
+
+void WalkExperiments(
+    absl::FunctionRef<void(absl::string_view name, bool active)> callback) {
+  for (const auto& config : experiments) {
+    callback(config.name, IsExperimentActive(config.id));
+  }
 }
 
 }  // namespace tcmalloc

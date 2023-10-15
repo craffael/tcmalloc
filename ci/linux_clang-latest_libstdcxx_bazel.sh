@@ -36,7 +36,7 @@ if [ -z ${EXCEPTIONS_MODE:-} ]; then
   EXCEPTIONS_MODE="-fno-exceptions -fexceptions"
 fi
 
-readonly DOCKER_CONTAINER="gcr.io/google.com/absl-177019/linux_hybrid-latest:20210525"
+readonly DOCKER_CONTAINER="gcr.io/google.com/absl-177019/linux_hybrid-latest:20230217"
 
 # USE_BAZEL_CACHE=1 only works on Kokoro.
 # Without access to the credentials this won't work.
@@ -67,11 +67,11 @@ for std in ${STD}; do
           --compilation_mode="${compilation_mode}" \
           --copt="--gcc-toolchain=/usr/local" \
           --copt="${exceptions_mode}" \
-          --copt=-Werror \
           --define="absl=1" \
           --distdir="/bazel-distdir" \
           --keep_going \
           --linkopt="--gcc-toolchain=/usr/local" \
+          --remote_download_minimal \
           --show_timestamps \
           --test_env="GTEST_INSTALL_FAILURE_SIGNAL_HANDLER=1" \
           --test_env="TZDIR=/abseil-cpp/absl/time/internal/cctz/testdata/zoneinfo" \

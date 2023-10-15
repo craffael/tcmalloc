@@ -15,8 +15,6 @@
 // Test speed of handling fragmented heap
 
 #include <stddef.h>
-#include <stdio.h>
-#include <stdlib.h>
 
 #include <new>
 #include <vector>

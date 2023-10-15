@@ -60,12 +60,13 @@ void PageMap::MapRootWithSmallPages() {
   // so we will not end up forcing it to be small pages.
   if (rend > rbegin) {
     size_t rlength = rend - rbegin;
+    ErrnoRestorer errno_restorer;
     madvise(reinterpret_cast<void*>(rbegin), rlength, MADV_NOHUGEPAGE);
   }
 }
 
 void* MetaDataAlloc(size_t bytes) ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock) {
-  return Static::arena().Alloc(bytes);
+  return tc_globals.arena().Alloc(bytes);
 }
 
 }  // namespace tcmalloc_internal

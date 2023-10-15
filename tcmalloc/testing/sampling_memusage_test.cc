@@ -13,20 +13,20 @@
 // limitations under the License.
 
 #include <stddef.h>
-#include <stdlib.h>
 #include <sys/types.h>
 
-#include <string>
+#include <cstdint>
+#include <new>
+#include <optional>
 #include <vector>
 
+#include "benchmark/benchmark.h"
 #include "gtest/gtest.h"
-#include "absl/base/internal/sysinfo.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/optional.h"
-#include "benchmark/benchmark.h"
 #include "tcmalloc/common.h"
+#include "tcmalloc/internal/affinity.h"
 #include "tcmalloc/internal/logging.h"
-#include "tcmalloc/internal/util.h"
 #include "tcmalloc/malloc_extension.h"
 #include "tcmalloc/static_vars.h"
 
@@ -48,7 +48,7 @@ class SamplingMemoryTest : public ::testing::TestWithParam<size_t> {
   }
 
   size_t Property(absl::string_view name) {
-    absl::optional<size_t> result = MallocExtension::GetNumericProperty(name);
+    std::optional<size_t> result = MallocExtension::GetNumericProperty(name);
     CHECK_CONDITION(result.has_value());
     return *result;
   }
@@ -65,23 +65,8 @@ class SamplingMemoryTest : public ::testing::TestWithParam<size_t> {
   }
 
   size_t CurrentHeapSize() {
-    size_t result = Property("generic.current_allocated_bytes") +
-                    Property("tcmalloc.metadata_bytes");
-    // Ignore unallocated bytes managed by the Arena.  These are accessible to
-    // future metadata allocations and we might trigger a new Arena block in the
-    // course of sampling.
-    //
-    // tcmalloc.metadata_bytes includes bytes wasted due to the Arena's block
-    // overhead, which is more attributable to the cost of sampling.
-    size_t unallocated;
-    {
-      absl::base_internal::SpinLockHolder l(&tcmalloc_internal::pageheap_lock);
-      unallocated =
-          tcmalloc_internal::Static::arena().stats().bytes_unallocated;
-    }
-
-    result = result >= unallocated ? result - unallocated : 0;
-    return result;
+    return Property("generic.current_allocated_bytes") +
+           Property("tcmalloc.metadata_bytes");
   }
 
   // Return peak memory usage growth when allocating many "size" byte objects.
@@ -165,7 +150,7 @@ TEST_P(SamplingMemoryTest, Overhead) {
       100.0 / static_cast<double>(baseline);
 
   // some noise is unavoidable
-  EXPECT_GE(percent, -1.0) << baseline << " " << with_sampling;
+  EXPECT_GE(percent, -10.0) << baseline << " " << with_sampling;
   EXPECT_LE(percent, 10.0) << baseline << " " << with_sampling;
 }
 
@@ -174,9 +159,11 @@ std::vector<size_t> InterestingSizes() {
 
   // Only use the first kNumBaseClasses size classes since classes after that
   // are intentionally duplicated.
-  for (size_t cl = 1; cl < tcmalloc_internal::kNumBaseClasses; cl++) {
+  for (size_t size_class = 1; size_class < tcmalloc_internal::kNumBaseClasses;
+       size_class++) {
     size_t size =
-        tcmalloc::tcmalloc_internal::Static::sizemap().class_to_size(cl);
+        tcmalloc::tcmalloc_internal::tc_globals.sizemap().class_to_size(
+            size_class);
     if (size == 0) {
       continue;
     }

@@ -18,15 +18,18 @@
 
 #include <limits>
 
+#include "absl/base/attributes.h"
 #include "absl/base/internal/cycleclock.h"
 #include "absl/base/internal/spinlock.h"
 #include "absl/numeric/bits.h"
 #include "tcmalloc/common.h"
+#include "tcmalloc/internal/allocation_guard.h"
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/page_heap_allocator.h"
 #include "tcmalloc/pagemap.h"
 #include "tcmalloc/pages.h"
 #include "tcmalloc/parameters.h"
+#include "tcmalloc/span.h"
 #include "tcmalloc/static_vars.h"
 #include "tcmalloc/system-alloc.h"
 
@@ -42,7 +45,7 @@ void PageHeap::RecordSpan(Span* span) {
   }
 }
 
-PageHeap::PageHeap(MemoryTag tag) : PageHeap(&Static::pagemap(), tag) {}
+PageHeap::PageHeap(MemoryTag tag) : PageHeap(&tc_globals.pagemap(), tag) {}
 
 PageHeap::PageHeap(PageMap* map, MemoryTag tag)
     : PageAllocatorInterface("PageHeap", map, tag),
@@ -91,14 +94,15 @@ Span* PageHeap::AllocateSpan(Length n, bool* from_returned) {
   return result;
 }
 
-Span* PageHeap::New(Length n) {
+Span* PageHeap::New(Length n,
+                    SpanAllocInfo span_alloc_info ABSL_ATTRIBUTE_UNUSED) {
   ASSERT(n > Length(0));
   bool from_returned;
   Span* result;
   {
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    AllocationGuardSpinLockHolder h(&pageheap_lock);
     result = AllocateSpan(n, &from_returned);
-    if (result) Static::page_allocator().ShrinkToUsageLimit();
+    if (result) tc_globals.page_allocator().ShrinkToUsageLimit(n);
     if (result) info_.RecordAlloc(result->first_page(), result->num_pages());
   }
 
@@ -130,18 +134,19 @@ static bool IsSpanBetter(Span* span, Span* best, Length n) {
 // unnecessary Carves in New) but it's not anywhere
 // close to a fast path, and is going to be replaced soon anyway, so
 // don't bother.
-Span* PageHeap::NewAligned(Length n, Length align) {
+Span* PageHeap::NewAligned(Length n, Length align,
+                           SpanAllocInfo span_alloc_info) {
   ASSERT(n > Length(0));
   ASSERT(absl::has_single_bit(align.raw_num()));
 
   if (align <= Length(1)) {
-    return New(n);
+    return New(n, span_alloc_info);
   }
 
   bool from_returned;
   Span* span;
   {
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    AllocationGuardSpinLockHolder h(&pageheap_lock);
     Length extra = align - Length(1);
     span = AllocateSpan(n + extra, &from_returned);
     if (span == nullptr) return nullptr;
@@ -259,11 +264,11 @@ Span* PageHeap::Carve(Span* span, Length n) {
   return span;
 }
 
-void PageHeap::Delete(Span* span) {
+void PageHeap::Delete(Span* span, size_t objects_per_span) {
   ASSERT(GetMemoryTag(span->start_address()) == tag_);
   info_.RecordFree(span->first_page(), span->num_pages());
   ASSERT(Check());
-  ASSERT(span->location() == Span::IN_USE);
+  CHECK_CONDITION(span->location() == Span::IN_USE);
   ASSERT(!span->sampled());
   ASSERT(span->num_pages() > Length(0));
   ASSERT(pagemap_->GetDescriptor(span->first_page()) == span);
@@ -329,12 +334,16 @@ void PageHeap::PrependToFreeList(Span* span) {
 
 void PageHeap::RemoveFromFreeList(Span* span) {
   ASSERT(span->location() != Span::IN_USE);
+  SpanListPair* list = (span->num_pages() < kMaxPages)
+                           ? &free_[span->num_pages().raw_num()]
+                           : &large_;
   if (span->location() == Span::ON_NORMAL_FREELIST) {
     stats_.free_bytes -= span->bytes_in_span();
+    list->normal.remove(span);
   } else {
     stats_.unmapped_bytes -= span->bytes_in_span();
+    list->returned.remove(span);
   }
-  span->RemoveFromList();
 }
 
 Length PageHeap::ReleaseLastNormalSpan(SpanListPair* slist) {
@@ -364,11 +373,15 @@ Length PageHeap::ReleaseLastNormalSpan(SpanListPair* slist) {
   pageheap_lock.Unlock();
 
   const Length n = s->num_pages();
-  SystemRelease(s->start_address(), s->bytes_in_span());
+  bool success = SystemRelease(s->start_address(), s->bytes_in_span());
 
   pageheap_lock.Lock();
-  stats_.free_bytes -= s->bytes_in_span();
-  s->set_location(Span::ON_RETURNED_FREELIST);
+  if (ABSL_PREDICT_TRUE(success)) {
+    stats_.free_bytes -= s->bytes_in_span();
+    s->set_location(Span::ON_RETURNED_FREELIST);
+  } else {
+    s->set_location(Span::ON_NORMAL_FREELIST);
+  }
   MergeIntoFreeList(s);  // Coalesces if possible.
   return n;
 }
@@ -425,8 +438,7 @@ void PageHeap::GetLargeSpanStats(LargeSpanStats* result) {
 
 bool PageHeap::GrowHeap(Length n) {
   if (n > Length::max()) return false;
-  size_t actual_size;
-  void* ptr = SystemAlloc(n.in_bytes(), &actual_size, kPageSize, tag_);
+  auto [ptr, actual_size] = SystemAlloc(n.in_bytes(), kPageSize, tag_);
   if (ptr == nullptr) return false;
   n = BytesToLengthFloor(actual_size);
 
@@ -441,7 +453,7 @@ bool PageHeap::GrowHeap(Length n) {
   // Make sure pagemap has entries for all of the new pages.
   // Plus ensure one before and one after so coalescing code
   // does not need bounds-checking.
-  if (pagemap_->Ensure(p - Length(1), n + Length(2))) {
+  if (ABSL_PREDICT_TRUE(pagemap_->Ensure(p - Length(1), n + Length(2)))) {
     // Pretend the new area is allocated and then return it to cause
     // any necessary coalescing to occur.
     Span* span = Span::New(p, n);
@@ -453,8 +465,10 @@ bool PageHeap::GrowHeap(Length n) {
   } else {
     // We could not allocate memory within the pagemap.
     // Note the following leaks virtual memory, but at least it gets rid of
-    // the underlying physical memory.
-    SystemRelease(ptr, actual_size);
+    // the underlying physical memory.  If SystemRelease fails, there's little
+    // we can do (we couldn't allocate for Ensure), but we have the consolation
+    // that the memory has not been touched (so it is likely not populated).
+    (void)SystemRelease(ptr, actual_size);
     return false;
   }
 }
@@ -466,7 +480,7 @@ bool PageHeap::Check() {
 }
 
 void PageHeap::PrintInPbtxt(PbtxtRegion* region) {
-  absl::base_internal::SpinLockHolder h(&pageheap_lock);
+  AllocationGuardSpinLockHolder h(&pageheap_lock);
   SmallSpanStats small;
   GetSmallSpanStats(&small);
   LargeSpanStats large;
@@ -494,7 +508,7 @@ void PageHeap::PrintInPbtxt(PbtxtRegion* region) {
 }
 
 void PageHeap::Print(Printer* out) {
-  absl::base_internal::SpinLockHolder h(&pageheap_lock);
+  AllocationGuardSpinLockHolder h(&pageheap_lock);
   SmallSpanStats small;
   GetSmallSpanStats(&small);
   LargeSpanStats large;

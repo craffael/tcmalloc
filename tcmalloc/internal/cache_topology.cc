@@ -17,10 +17,14 @@
 #include <fcntl.h>
 #include <string.h>
 
+#include <cerrno>
+#include <cstdio>
+
 #include "absl/strings/numbers.h"
 #include "absl/strings/string_view.h"
 #include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/logging.h"
+#include "tcmalloc/internal/sysinfo.h"
 #include "tcmalloc/internal/util.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
@@ -49,17 +53,25 @@ int BuildCpuToL3CacheMap_FindFirstNumberInBuf(absl::string_view current) {
   return first_cpu;
 }
 
-int BuildCpuToL3CacheMap(uint8_t l3_cache_index[CPU_SETSIZE]) {
-  int index = 0;
-  // Set to a sane value.
-  memset(l3_cache_index, 0, CPU_SETSIZE);
-  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+void CacheTopology::Init() {
+  cpu_count_ = NumCPUs();
+  for (int cpu = 0; cpu < cpu_count_; ++cpu) {
     const int fd = OpenSysfsCacheList(cpu);
     if (fd == -1) {
       // At some point we reach the number of CPU on the system, and
       // we should exit. We verify that there was no other problem.
       CHECK_CONDITION(errno == ENOENT);
-      return index;
+      // For aarch64 if
+      // /sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list is missing
+      // then L3 is assumed to be shared by all CPUs.
+      // TODO(b/210049384): find a better replacement for shared_cpu_list in
+      // this case, e.g. based on numa nodes.
+#ifdef __aarch64__
+      if (l3_count_ == 0) {
+        l3_count_ = 1;
+      }
+#endif
+      return;
     }
     // The file contains something like:
     //   0-11,22-33
@@ -75,12 +87,11 @@ int BuildCpuToL3CacheMap(uint8_t l3_cache_index[CPU_SETSIZE]) {
     CHECK_CONDITION(first_cpu < CPU_SETSIZE);
     CHECK_CONDITION(first_cpu <= cpu);
     if (cpu == first_cpu) {
-      l3_cache_index[cpu] = index++;
+      l3_cache_index_[cpu] = l3_count_++;
     } else {
-      l3_cache_index[cpu] = l3_cache_index[first_cpu];
+      l3_cache_index_[cpu] = l3_cache_index_[first_cpu];
     }
   }
-  return index;
 }
 
 }  // namespace tcmalloc_internal

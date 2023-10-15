@@ -14,11 +14,39 @@
 
 """ Helper functions to simplify TCMalloc BUILD files """
 
-variants = [
+build_variants = [
+    {
+        "name": "8k_pages",
+        "copts": [],
+    },
+    {
+        "name": "deprecated_perthread",
+        "copts": ["-DTCMALLOC_DEPRECATED_PERTHREAD"],
+        "visibility": ["//tcmalloc:tcmalloc_tests"],
+    },
+    {
+        "name": "large_pages",
+        "copts": ["-DTCMALLOC_LARGE_PAGES"],
+    },
+    {
+        "name": "256k_pages",
+        "copts": ["-DTCMALLOC_256K_PAGES"],
+    },
+    {
+        "name": "small_but_slow",
+        "copts": ["-DTCMALLOC_SMALL_BUT_SLOW"],
+    },
+    {
+        "name": "numa_aware",
+        "copts": ["-DTCMALLOC_NUMA_AWARE"],
+    },
+]
+
+test_variants = [
     {
         "name": "8k_pages",
         "malloc": "//tcmalloc",
-        "deps": ["//tcmalloc:common"],
+        "deps": ["//tcmalloc:common_8k_pages"],
         "copts": [],
     },
     {
@@ -36,66 +64,28 @@ variants = [
         ],
     },
     {
-        "name": "256k_pages_and_numa_disabled",
-        "malloc": "//tcmalloc:tcmalloc_256k_pages_and_numa",
-        "deps": ["//tcmalloc:common_256k_pages_and_numa"],
-        "copts": [
-            "-DTCMALLOC_256K_PAGES",
-            "-DTCMALLOC_NUMA_AWARE",
-        ],
-    },
-    {
-        "name": "256k_pages_and_numa_enabled",
-        "malloc": "//tcmalloc:tcmalloc_256k_pages_and_numa",
-        "deps": ["//tcmalloc:common_256k_pages_and_numa"],
-        "copts": [
-            "-DTCMALLOC_256K_PAGES",
-            "-DTCMALLOC_NUMA_AWARE",
-        ],
-        "env": {"TCMALLOC_NUMA_AWARE": "1"},
-    },
-    {
         "name": "small_but_slow",
         "malloc": "//tcmalloc:tcmalloc_small_but_slow",
         "deps": ["//tcmalloc:common_small_but_slow"],
         "copts": ["-DTCMALLOC_SMALL_BUT_SLOW"],
     },
     {
-        "name": "legacy_spans",
-        "malloc": "//tcmalloc",
-        "deps": [
-            "//tcmalloc:common",
-            "//tcmalloc:want_legacy_spans",
-        ],
-        "copts": [],
-    },
-    {
-        "name": "8k_pages_not_hotcold",
-        "malloc": "//tcmalloc",
-        "deps": ["//tcmalloc:common"],
-        "copts": [],
-        "env": {"TCMALLOC_HOTCOLD_CONTROL": "0"},
-    },
-    {
         "name": "256k_pages_pow2",
         "malloc": "//tcmalloc:tcmalloc_256k_pages",
-        "deps": ["//tcmalloc:common_256k_pages"],
+        "deps": [
+            "//tcmalloc:common_256k_pages",
+        ],
         "copts": ["-DTCMALLOC_256K_PAGES"],
         "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_POW2_SIZECLASS"},
     },
     {
-        "name": "256k_pages_pow2_sharded_transfer_cache",
+        "name": "256k_pages_sharded_transfer_cache",
         "malloc": "//tcmalloc:tcmalloc_256k_pages",
-        "deps": ["//tcmalloc:common_256k_pages"],
+        "deps": [
+            "//tcmalloc:common_256k_pages",
+        ],
         "copts": ["-DTCMALLOC_256K_PAGES"],
         "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_SHARDED_TRANSFER_CACHE"},
-    },
-    {
-        "name": "256k_pages_pow2_below64",
-        "malloc": "//tcmalloc:tcmalloc_256k_pages",
-        "deps": ["//tcmalloc:common_256k_pages"],
-        "copts": ["-DTCMALLOC_256K_PAGES"],
-        "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_POW2_BELOW64_SIZECLASS"},
     },
     {
         "name": "numa_aware",
@@ -107,33 +97,94 @@ variants = [
         "copts": ["-DTCMALLOC_NUMA_AWARE"],
     },
     {
-        "name": "ring_buffer_transfer_cache",
-        "malloc": "//tcmalloc",
-        "deps": ["//tcmalloc:common"],
-        "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_RING_BUFFER_TRANSFER_CACHE"},
-    },
-    {
-        "name": "legacy_transfer_cache",
-        "malloc": "//tcmalloc",
-        "deps": ["//tcmalloc:common"],
-        "env": {"TCMALLOC_INTERNAL_TRANSFERCACHE_CONTROL": "0"},
-    },
-    {
-        "name": "256k_pages_pow2_with_per_ccx",
+        "name": "256k_pages_pow2_sharded_transfer_cache",
         "malloc": "//tcmalloc:tcmalloc_256k_pages",
-        "deps": ["//tcmalloc:common_256k_pages"],
+        "deps": [
+            "//tcmalloc:common_256k_pages",
+        ],
         "copts": ["-DTCMALLOC_256K_PAGES"],
-        "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_POW2_SIZECLASS"},
+        "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_POW2_SIZECLASS,TEST_ONLY_TCMALLOC_SHARDED_TRANSFER_CACHE"},
     },
     {
-        "name": "heterogeneous_per_cpu_cache",
+        "name": "legacy_size_classes",
         "malloc": "//tcmalloc",
-        "deps": ["//tcmalloc:common"],
-        "env": {"BORG_EXPERIMENTS": "TCMALLOC_HETEROGENEOUS_CACHES"},
+        "deps": [
+            "//tcmalloc:common_8k_pages",
+            "//tcmalloc:want_legacy_size_classes",
+        ],
+        "copts": [],
+    },
+    {
+        "name": "chunks_for_page_tracker_lists",
+        "malloc": "//tcmalloc",
+        "deps": ["//tcmalloc:common_8k_pages"],
+        "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_FILLER_CHUNKS_PER_ALLOC"},
+    },
+    {
+        "name": "512k_slab",
+        "malloc": "//tcmalloc",
+        "deps": ["//tcmalloc:common_8k_pages"],
+        "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_512K_SLAB"},
+    },
+    {
+        "name": "no_hpaa",
+        "malloc": "//tcmalloc",
+        "deps": [
+            "//tcmalloc:common_8k_pages",
+            "//tcmalloc:want_no_hpaa",
+        ],
+    },
+    {
+        "name": "hpaa",
+        "malloc": "//tcmalloc",
+        "deps": [
+            "//tcmalloc:common_8k_pages",
+            "//tcmalloc:want_hpaa",
+        ],
+    },
+    {
+        "name": "deprecated_perthread",
+        "malloc": "//tcmalloc:tcmalloc_deprecated_perthread",
+        "copts": ["-DTCMALLOC_DEPRECATED_PERTHREAD"],
+        "deps": [
+            "//tcmalloc:common_deprecated_perthread",
+        ],
+    },
+    {
+        "name": "flat_cpu_caches",
+        "malloc": "//tcmalloc",
+        "deps": [
+            "//tcmalloc:common_8k_pages",
+        ],
+        "env": {"PERCPU_VCPU_MODE": "flat"},
+    },
+    {
+        "name": "real_cpu_caches",
+        "malloc": "//tcmalloc",
+        "deps": [
+            "//tcmalloc:common_8k_pages",
+        ],
+        "env": {"PERCPU_VCPU_MODE": "none"},
     },
 ]
 
-def create_tcmalloc_variant_targets(create_one, name, srcs, **kwargs):
+def create_tcmalloc_library(
+        name,
+        copts,
+        linkopts,
+        srcs,
+        deps,
+        **kwargs):
+    native.cc_library(
+        name = name,
+        srcs = srcs,
+        copts = copts,
+        linkopts = linkopts,
+        deps = deps,
+        **kwargs
+    )
+
+def create_tcmalloc_build_variant_targets(create_one, name, srcs, **kwargs):
     """ Invokes create_one once per TCMalloc variant
 
     Args:
@@ -151,7 +202,48 @@ def create_tcmalloc_variant_targets(create_one, name, srcs, **kwargs):
     linkopts = kwargs.pop("linkopts", [])
 
     variant_targets = []
-    for variant in variants:
+    for variant in build_variants:
+        inner_target_name = name + "_" + variant["name"]
+        variant_targets.append(inner_target_name)
+        create_one(
+            inner_target_name,
+            copts = copts + variant.get("copts", []),
+            linkopts = linkopts + variant.get("linkopts", []),
+            srcs = srcs,
+            deps = deps + variant.get("deps", []),
+            **kwargs
+        )
+
+    return variant_targets
+
+# Create test_suite of name containing build variants.
+def create_tcmalloc_libraries(name, srcs, **kwargs):
+    create_tcmalloc_build_variant_targets(
+        create_tcmalloc_library,
+        name,
+        srcs,
+        **kwargs
+    )
+
+def create_tcmalloc_test_variant_targets(create_one, name, srcs, **kwargs):
+    """ Invokes create_one once per TCMalloc variant
+
+    Args:
+      create_one: A function invoked once per variant with arguments
+        matching those of a cc_binary or cc_test target.
+      name: The base name, suffixed with variant names to form target names.
+      srcs: Source files to be built.
+      **kwargs: Other arguments passed through to create_one.
+
+    Returns:
+      A list of the targets generated; i.e. each name passed to create_one.
+    """
+    copts = kwargs.pop("copts", [])
+    deps = kwargs.pop("deps", [])
+    linkopts = kwargs.pop("linkopts", [])
+
+    variant_targets = []
+    for variant in test_variants:
         inner_target_name = name + "_" + variant["name"]
         variant_targets.append(inner_target_name)
         env = kwargs.pop("env", {})
@@ -190,7 +282,7 @@ def create_tcmalloc_test(
 
 # Create test_suite of name containing tests variants.
 def create_tcmalloc_testsuite(name, srcs, **kwargs):
-    variant_targets = create_tcmalloc_variant_targets(
+    variant_targets = create_tcmalloc_test_variant_targets(
         create_tcmalloc_test,
         name,
         srcs,
@@ -215,7 +307,7 @@ def create_tcmalloc_benchmark(name, srcs, **kwargs):
 
 # Declare a suite of benchmark binaries, one per variant.
 def create_tcmalloc_benchmark_suite(name, srcs, **kwargs):
-    variant_targets = create_tcmalloc_variant_targets(
+    variant_targets = create_tcmalloc_test_variant_targets(
         create_tcmalloc_benchmark,
         name,
         srcs,

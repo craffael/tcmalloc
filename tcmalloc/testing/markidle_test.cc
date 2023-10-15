@@ -14,13 +14,13 @@
 //
 // MallocExtension::MarkThreadIdle() testing
 #include <stddef.h>
-#include <stdio.h>
 #include <stdlib.h>
 
+#include <optional>
 #include <thread>  // NOLINT(build/c++11)
 
 #include "gtest/gtest.h"
-#include "absl/flags/flag.h"
+#include "absl/types/optional.h"
 #include "tcmalloc/malloc_extension.h"
 
 namespace tcmalloc {
@@ -67,7 +67,7 @@ TEST(MarkIdleTest, MultipleIdleNonIdlePhases) {
 
 // Get current thread cache usage
 static size_t GetTotalThreadCacheSize() {
-  absl::optional<size_t> result = MallocExtension::GetNumericProperty(
+  std::optional<size_t> result = MallocExtension::GetNumericProperty(
       "tcmalloc.current_total_thread_cache_bytes");
   EXPECT_TRUE(result.has_value());
   return *result;

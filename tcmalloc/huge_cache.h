@@ -37,7 +37,12 @@ GOOGLE_MALLOC_SECTION_BEGIN
 namespace tcmalloc {
 namespace tcmalloc_internal {
 
-typedef void (*MemoryModifyFunction)(void *start, size_t len);
+class MemoryModifyFunction {
+ public:
+  virtual ~MemoryModifyFunction() = default;
+
+  ABSL_MUST_USE_RESULT virtual bool operator()(void* start, size_t len) = 0;
+};
 
 // Track the extreme values of a HugeLength value over the past
 // kWindow (time ranges approximate.)
@@ -48,8 +53,8 @@ class MinMaxTracker {
       : kEpochLength(w / kEpochs), timeseries_(clock, w) {}
 
   void Report(HugeLength val);
-  void Print(Printer *out) const;
-  void PrintInPbtxt(PbtxtRegion *hpaa) const;
+  void Print(Printer* out) const;
+  void PrintInPbtxt(PbtxtRegion* hpaa) const;
 
   // If t < kEpochLength, these functions return statistics for last epoch. The
   // granularity is kEpochLength (rounded up).
@@ -78,7 +83,7 @@ class MinMaxTracker {
 
     bool empty() const { return (*this == Nil()); }
 
-    bool operator==(const Extrema &other) const;
+    bool operator==(const Extrema& other) const;
   };
 
   TimeSeriesTracker<Extrema, HugeLength, kEpochs> timeseries_;
@@ -94,15 +99,43 @@ constexpr HugeLength MinMaxTracker<kEpochs>::kMaxVal;
 class HugeCache {
  public:
   // For use in production
-  HugeCache(HugeAllocator *allocator, MetadataAllocFunction meta_allocate,
-            MemoryModifyFunction unback)
+  HugeCache(HugeAllocator* allocator,
+            MetadataAllocator& meta_allocate ABSL_ATTRIBUTE_LIFETIME_BOUND,
+            MemoryModifyFunction& unback ABSL_ATTRIBUTE_LIFETIME_BOUND)
       : HugeCache(allocator, meta_allocate, unback,
                   Clock{.now = absl::base_internal::CycleClock::Now,
                         .freq = absl::base_internal::CycleClock::Frequency}) {}
 
-  // For testing with mock clock
-  HugeCache(HugeAllocator *allocator, MetadataAllocFunction meta_allocate,
-            MemoryModifyFunction unback, Clock clock)
+  // For testing with mock clock.
+  //
+  // 2s (kCacheTime * 2) looks like an arbitrary window; it mostly is.
+  //
+  // Suffice to say that the below code (see MaybeGrowCacheLimit)
+  // tries to make sure the cache is sized to protect a working set
+  // that ebbs for 1 second, as a reasonable heuristic. This means it
+  // needs 1s of historical data to examine.
+  //
+  // Why 2s duration, then? Two reasons:
+  //
+  // - (minor) granularity of epoch boundaries make me want to err towards
+  //   keeping a bit too much data over a bit too little.
+  //
+  // - (major) hysteresis: in ReleaseCachedPages we try to detect
+  //   mistaken cache expansion and reverse it. I hope that using a
+  //   longer timescale than our expansion will increase stability
+  //   here: I will take some caches staying a bit too big over caches
+  //   oscillating back and forth between two size estimates, so we
+  //   require stronger evidence (longer time) to reverse an expansion
+  //   than to make it.
+  //
+  // We also tried other algorithms, but this one is simple and suffices to
+  // capture the empirical dynamics we've seen.  See "Beyond Malloc
+  // Efficiency..." (https://research.google/pubs/pub50370/) for more
+  // information.
+  HugeCache(HugeAllocator* allocator,
+            MetadataAllocator& meta_allocate ABSL_ATTRIBUTE_LIFETIME_BOUND,
+            MemoryModifyFunction& unback ABSL_ATTRIBUTE_LIFETIME_BOUND,
+            Clock clock)
       : allocator_(allocator),
         cache_(meta_allocate),
         clock_(clock),
@@ -120,7 +153,7 @@ class HugeCache {
   // memory that's currently backed from the kernel if we have it available.
   // *from_released is set to false if the return range is already backed;
   // otherwise, it is set to true (and the caller should back it.)
-  HugeRange Get(HugeLength n, bool *from_released);
+  HugeRange Get(HugeLength n, bool* from_released);
 
   // Deallocate <r> (assumed to be backed by the kernel.)
   void Release(HugeRange r);
@@ -140,8 +173,8 @@ class HugeCache {
   // Sum total of unreleased requests.
   HugeLength usage() const { return usage_; }
 
-  void AddSpanStats(SmallSpanStats *small, LargeSpanStats *large,
-                    PageAgeHistograms *ages) const;
+  void AddSpanStats(SmallSpanStats* small, LargeSpanStats* large,
+                    PageAgeHistograms* ages) const;
 
   BackingStats stats() const {
     BackingStats s;
@@ -151,11 +184,11 @@ class HugeCache {
     return s;
   }
 
-  void Print(Printer *out);
-  void PrintInPbtxt(PbtxtRegion *hpaa);
+  void Print(Printer* out);
+  void PrintInPbtxt(PbtxtRegion* hpaa);
 
  private:
-  HugeAllocator *allocator_;
+  HugeAllocator* allocator_;
 
   // We just cache-missed a request for <missed> pages;
   // should we grow?
@@ -168,9 +201,9 @@ class HugeCache {
   // returning the number removed.
   HugeLength ShrinkCache(HugeLength target);
 
-  HugeRange DoGet(HugeLength n, bool *from_released);
+  HugeRange DoGet(HugeLength n, bool* from_released);
 
-  HugeAddressMap::Node *Find(HugeLength n);
+  HugeAddressMap::Node* Find(HugeLength n);
 
   HugeAddressMap cache_;
   HugeLength size_{NHugePages(0)};
@@ -212,13 +245,11 @@ class HugeCache {
   MinMaxTracker<> usage_tracker_;
   MinMaxTracker<> off_peak_tracker_;
   MinMaxTracker<> size_tracker_;
-  HugeLength max_size_{NHugePages(0)};
-  HugeLength max_rss_{NHugePages(0)};
 
   HugeLength total_fast_unbacked_{NHugePages(0)};
   HugeLength total_periodic_unbacked_{NHugePages(0)};
 
-  MemoryModifyFunction unback_;
+  MemoryModifyFunction& unback_;
 };
 
 }  // namespace tcmalloc_internal

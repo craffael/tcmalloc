@@ -14,54 +14,51 @@
 
 #include "tcmalloc/huge_page_filler.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/mman.h>
 
+#include <algorithm>
 #include <cstdint>
-#include <iterator>
 #include <memory>
-#include <new>
 #include <random>
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/algorithm/container.h"
+#include "absl/base/attributes.h"
 #include "absl/base/internal/sysinfo.h"
-#include "absl/base/thread_annotations.h"
-#include "absl/container/flat_hash_map.h"
+#include "absl/base/macros.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/flags/flag.h"
 #include "absl/memory/memory.h"
-#include "absl/random/bernoulli_distribution.h"
 #include "absl/random/random.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "benchmark/benchmark.h"
 #include "tcmalloc/common.h"
+#include "tcmalloc/huge_cache.h"
 #include "tcmalloc/huge_pages.h"
+#include "tcmalloc/internal/clock.h"
+#include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/pages.h"
+#include "tcmalloc/span.h"
 #include "tcmalloc/stats.h"
 
 using tcmalloc::tcmalloc_internal::Length;
 
 ABSL_FLAG(Length, page_tracker_defrag_lim, Length(32),
           "Max allocation size for defrag test");
-
-ABSL_FLAG(Length, frag_req_limit, Length(32),
-          "request size limit for frag test");
-ABSL_FLAG(Length, frag_size, Length(512 * 1024),
-          "target number of pages for frag test");
-ABSL_FLAG(uint64_t, frag_iters, 10 * 1000 * 1000, "iterations for frag test");
 
 ABSL_FLAG(double, release_until, 0.01,
           "fraction of used we target in pageheap");
@@ -160,13 +157,18 @@ class PageTrackerTest : public testing::Test {
   PageTrackerTest()
       :  // an unlikely magic page
         huge_(HugePageContaining(reinterpret_cast<void*>(0x1abcde200000))),
-        tracker_(huge_, absl::base_internal::CycleClock::Now()) {}
+        tracker_(huge_, absl::base_internal::CycleClock::Now(),
+                 /*was_donated=*/false) {}
 
   ~PageTrackerTest() override { mock_.VerifyAndClear(); }
 
   struct PAlloc {
     PageId p;
     Length n;
+    SpanAllocInfo span_alloc_info;
+
+    PAlloc(PageId pp, Length nn, SpanAllocInfo s)
+        : p(pp), n(nn), span_alloc_info(s) {}
   };
 
   void Mark(PAlloc a, size_t mark) {
@@ -179,17 +181,21 @@ class PageTrackerTest : public testing::Test {
     }
   }
 
-  class MockUnbackInterface {
+  class MockUnbackInterface final : public MemoryModifyFunction {
    public:
-    void Unback(void* p, size_t len) {
-      CHECK_CONDITION(actual_index_ < kMaxCalls);
+    ABSL_MUST_USE_RESULT bool operator()(void* p, size_t len) override {
+      CHECK_CONDITION(actual_index_ < ABSL_ARRAYSIZE(actual_));
       actual_[actual_index_] = {p, len};
+      CHECK_CONDITION(actual_index_ < ABSL_ARRAYSIZE(expected_));
+      // Assume expected calls occur and use those return values.
+      const bool success = expected_[actual_index_].success;
       ++actual_index_;
+      return success;
     }
 
-    void Expect(void* p, size_t len) {
+    void Expect(void* p, size_t len, bool success) {
       CHECK_CONDITION(expected_index_ < kMaxCalls);
-      expected_[expected_index_] = {p, len};
+      expected_[expected_index_] = {p, len, success};
       ++expected_index_;
     }
 
@@ -208,6 +214,7 @@ class PageTrackerTest : public testing::Test {
     struct CallArgs {
       void* ptr{nullptr};
       size_t len{0};
+      bool success = true;
     };
 
     static constexpr size_t kMaxCalls = 10;
@@ -217,12 +224,8 @@ class PageTrackerTest : public testing::Test {
     size_t actual_index_{0};
   };
 
-  static void MockUnback(void* p, size_t len);
-
-  typedef PageTracker<MockUnback> TestPageTracker;
-
   // strict because release calls should only happen when we ask
-  static MockUnbackInterface mock_;
+  MockUnbackInterface mock_;
 
   void Check(PAlloc a, size_t mark) {
     EXPECT_LE(huge_.first_page(), a.p);
@@ -230,23 +233,23 @@ class PageTrackerTest : public testing::Test {
     size_t end = index + a.n.raw_num();
     EXPECT_LE(end, kPagesPerHugePage.raw_num());
     for (; index < end; ++index) {
-      EXPECT_EQ(mark, marks_[index]);
+      EXPECT_EQ(marks_[index], mark);
     }
   }
   size_t marks_[kPagesPerHugePage.raw_num()];
   HugePage huge_;
-  TestPageTracker tracker_;
+  PageTracker tracker_;
 
-  void ExpectPages(PAlloc a) {
+  void ExpectPages(PAlloc a, bool success = true) {
     void* ptr = a.p.start_addr();
     size_t bytes = a.n.in_bytes();
-    mock_.Expect(ptr, bytes);
+    mock_.Expect(ptr, bytes, success);
   }
 
-  PAlloc Get(Length n) {
+  PAlloc Get(Length n, SpanAllocInfo span_alloc_info) {
     absl::base_internal::SpinLockHolder l(&pageheap_lock);
     PageId p = tracker_.Get(n).page;
-    return {p, n};
+    return {p, n, span_alloc_info};
   }
 
   void Put(PAlloc a) {
@@ -256,18 +259,9 @@ class PageTrackerTest : public testing::Test {
 
   Length ReleaseFree() {
     absl::base_internal::SpinLockHolder l(&pageheap_lock);
-    return tracker_.ReleaseFree();
-  }
-
-  void MaybeRelease(PAlloc a) {
-    absl::base_internal::SpinLockHolder l(&pageheap_lock);
-    tracker_.MaybeRelease(a.p, a.n);
+    return tracker_.ReleaseFree(mock_);
   }
 };
-
-void PageTrackerTest::MockUnback(void* p, size_t len) { mock_.Unback(p, len); }
-
-PageTrackerTest::MockUnbackInterface PageTrackerTest::mock_;
 
 TEST_F(PageTrackerTest, AllocSane) {
   Length free = kPagesPerHugePage;
@@ -275,10 +269,10 @@ TEST_F(PageTrackerTest, AllocSane) {
   std::vector<PAlloc> allocs;
   // This should work without fragmentation.
   while (n <= free) {
-    ASSERT_LE(n, tracker_.longest_free_range());
-    EXPECT_EQ(kPagesPerHugePage - free, tracker_.used_pages());
-    EXPECT_EQ(free, tracker_.free_pages());
-    PAlloc a = Get(n);
+    ASSERT_GE(tracker_.longest_free_range(), n);
+    EXPECT_EQ(tracker_.used_pages(), kPagesPerHugePage - free);
+    EXPECT_EQ(tracker_.free_pages(), free);
+    PAlloc a = Get(n, {1, AccessDensityPrediction::kSparse});
     Mark(a, n.raw_num());
     allocs.push_back(a);
     free -= n;
@@ -293,38 +287,36 @@ TEST_F(PageTrackerTest, AllocSane) {
 
 TEST_F(PageTrackerTest, ReleasingReturn) {
   static const Length kAllocSize = kPagesPerHugePage / 4;
-  PAlloc a1 = Get(kAllocSize - Length(3));
-  PAlloc a2 = Get(kAllocSize);
-  PAlloc a3 = Get(kAllocSize + Length(1));
-  PAlloc a4 = Get(kAllocSize + Length(2));
+  SpanAllocInfo info = {1, AccessDensityPrediction::kSparse};
+  PAlloc a1 = Get(kAllocSize - Length(3), info);
+  PAlloc a2 = Get(kAllocSize, info);
+  PAlloc a3 = Get(kAllocSize + Length(1), info);
+  PAlloc a4 = Get(kAllocSize + Length(2), info);
 
   Put(a2);
   Put(a4);
   // We now have a hugepage that looks like [alloced] [free] [alloced] [free].
   // The free parts should be released when we mark the hugepage as such,
   // but not the allocated parts.
-  ExpectPages(a2);
-  ExpectPages(a4);
+  ExpectPages(a2, /*success=*/true);
+  ExpectPages(a4, /*success=*/true);
   ReleaseFree();
   mock_.VerifyAndClear();
 
-  // Now we return the other parts, and they *should* get released.
-  ExpectPages(a1);
-  ExpectPages(a3);
+  EXPECT_EQ(tracker_.released_pages(), a2.n + a4.n);
+  EXPECT_EQ(tracker_.free_pages(), a2.n + a4.n);
 
-  MaybeRelease(a1);
   Put(a1);
-
-  MaybeRelease(a3);
   Put(a3);
 }
 
 TEST_F(PageTrackerTest, ReleasingRetain) {
   static const Length kAllocSize = kPagesPerHugePage / 4;
-  PAlloc a1 = Get(kAllocSize - Length(3));
-  PAlloc a2 = Get(kAllocSize);
-  PAlloc a3 = Get(kAllocSize + Length(1));
-  PAlloc a4 = Get(kAllocSize + Length(2));
+  SpanAllocInfo info = {1, AccessDensityPrediction::kSparse};
+  PAlloc a1 = Get(kAllocSize - Length(3), info);
+  PAlloc a2 = Get(kAllocSize, info);
+  PAlloc a3 = Get(kAllocSize + Length(1), info);
+  PAlloc a4 = Get(kAllocSize + Length(2), info);
 
   Put(a2);
   Put(a4);
@@ -349,9 +341,49 @@ TEST_F(PageTrackerTest, ReleasingRetain) {
   mock_.VerifyAndClear();
 }
 
+TEST_F(PageTrackerTest, ReleasingRetainFailure) {
+  static const Length kAllocSize = kPagesPerHugePage / 4;
+  SpanAllocInfo info = {1, AccessDensityPrediction::kSparse};
+  PAlloc a1 = Get(kAllocSize - Length(3), info);
+  PAlloc a2 = Get(kAllocSize, info);
+  PAlloc a3 = Get(kAllocSize + Length(1), info);
+  PAlloc a4 = Get(kAllocSize + Length(2), info);
+
+  Put(a2);
+  Put(a4);
+  // We now have a hugepage that looks like [alloced] [free] [alloced] [free].
+  // The free parts should be released when we mark the hugepage as such if
+  // successful, but not the allocated parts.
+  ExpectPages(a2, /*success=*/true);
+  ExpectPages(a4, /*success=*/false);
+  ReleaseFree();
+  mock_.VerifyAndClear();
+
+  EXPECT_EQ(tracker_.released_pages(), a2.n);
+  EXPECT_EQ(tracker_.free_pages(), a2.n + a4.n);
+
+  // Now we return the other parts, and they shouldn't get released.
+  Put(a1);
+  Put(a3);
+
+  mock_.VerifyAndClear();
+
+  // But they will if we ReleaseFree.  We attempt to coalesce the deallocation
+  // of a3/a4.
+  ExpectPages(a1, /*success=*/true);
+  ExpectPages(PAlloc{std::min(a3.p, a4.p), a3.n + a4.n, info},
+              /*success=*/false);
+  ReleaseFree();
+  mock_.VerifyAndClear();
+
+  EXPECT_EQ(tracker_.released_pages(), a1.n + a2.n);
+  EXPECT_EQ(tracker_.free_pages(), a1.n + a2.n + a3.n + a4.n);
+}
+
 TEST_F(PageTrackerTest, Defrag) {
   absl::BitGen rng;
   const Length N = absl::GetFlag(FLAGS_page_tracker_defrag_lim);
+  SpanAllocInfo info = {1, AccessDensityPrediction::kSparse};
   auto dist = EmpiricalDistribution(N);
 
   std::vector<PAlloc> allocs;
@@ -362,7 +394,7 @@ TEST_F(PageTrackerTest, Defrag) {
     do {
       n = Length(dist(rng));
     } while (n > tracker_.longest_free_range());
-    PAlloc a = Get(n);
+    PAlloc a = Get(n, info);
     (absl::Bernoulli(rng, 1.0 / 2) ? allocs : doomed).push_back(a);
   }
 
@@ -405,7 +437,7 @@ TEST_F(PageTrackerTest, Defrag) {
       do {
         n = Length(dist(rng));
       } while (n > tracker_.longest_free_range());
-      allocs.push_back(Get(n));
+      allocs.push_back(Get(n, info));
     }
   }
 
@@ -424,9 +456,6 @@ TEST_F(PageTrackerTest, Defrag) {
     // We'd like to prety consistently rely on (75% of the time) reasonable
     // defragmentation (50% of space is fully usable...)
     // ...but we currently can't hit that mark consistently.
-    // The situation is worse on ppc with larger huge pages:
-    // pass rate for test is ~50% at 0.20. Reducing from 0.2 to 0.07.
-    // TODO(b/127466107) figure out a better solution.
     EXPECT_GE(p25, 0.07);
   }
 
@@ -439,12 +468,12 @@ TEST_F(PageTrackerTest, Defrag) {
     printf("Longest free quantiles:\n");
     printf("p10: %zu p25: %zu p50: %zu p75: %zu p90: %zu\n", p10.raw_num(),
            p25.raw_num(), p50.raw_num(), p75.raw_num(), p90.raw_num());
-    // Similarly, we'd really like for there usually (p25) to be a space
+    // Similarly, we'd really like for there usually (p50) to be a space
     // for a large allocation (N - note that we've cooked the books so that
     // the page tracker is going to be something like half empty (ish) and N
     // is small, so that should be doable.)
     // ...but, of course, it isn't.
-    EXPECT_GE(p25, Length(4));
+    EXPECT_GE(p50, Length(4));
   }
 
   for (auto a : allocs) {
@@ -454,7 +483,7 @@ TEST_F(PageTrackerTest, Defrag) {
 
 TEST_F(PageTrackerTest, Stats) {
   struct Helper {
-    static void Stat(const TestPageTracker& tracker,
+    static void Stat(const PageTracker& tracker,
                      std::vector<Length>* small_backed,
                      std::vector<Length>* small_unbacked, LargeSpanStats* large,
                      double* avg_age_backed, double* avg_age_unbacked) {
@@ -483,10 +512,14 @@ TEST_F(PageTrackerTest, Stats) {
   std::vector<Length> small_backed, small_unbacked;
   double avg_age_backed, avg_age_unbacked;
 
-  const PageId p = Get(kPagesPerHugePage).p;
+  SpanAllocInfo info1 = {kPagesPerHugePage.raw_num(),
+                         AccessDensityPrediction::kDense};
+  const PageId p = Get(kPagesPerHugePage, info1).p;
   const PageId end = p + kPagesPerHugePage;
   PageId next = p;
-  Put({next, kMaxPages + Length(1)});
+  Length n = kMaxPages + Length(1);
+  SpanAllocInfo info2 = {n.raw_num(), AccessDensityPrediction::kDense};
+  Put({next, n, info2});
   next += kMaxPages + Length(1);
 
   absl::SleepFor(absl::Milliseconds(10));
@@ -494,45 +527,48 @@ TEST_F(PageTrackerTest, Stats) {
                &avg_age_backed, &avg_age_unbacked);
   EXPECT_THAT(small_backed, testing::ElementsAre());
   EXPECT_THAT(small_unbacked, testing::ElementsAre());
-  EXPECT_EQ(1, large.spans);
-  EXPECT_EQ(kMaxPages + Length(1), large.normal_pages);
-  EXPECT_EQ(Length(0), large.returned_pages);
-  EXPECT_LE(0.01, avg_age_backed);
+  EXPECT_EQ(large.spans, 1);
+  EXPECT_EQ(large.normal_pages, kMaxPages + Length(1));
+  EXPECT_EQ(large.returned_pages, Length(0));
+  EXPECT_GE(avg_age_backed, 0.01);
 
   ++next;
-  Put({next, Length(1)});
+  SpanAllocInfo info3 = {1, AccessDensityPrediction::kSparse};
+  Put({next, Length(1), info3});
   next += Length(1);
   absl::SleepFor(absl::Milliseconds(20));
   Helper::Stat(tracker_, &small_backed, &small_unbacked, &large,
                &avg_age_backed, &avg_age_unbacked);
   EXPECT_THAT(small_backed, testing::ElementsAre(Length(1)));
   EXPECT_THAT(small_unbacked, testing::ElementsAre());
-  EXPECT_EQ(1, large.spans);
-  EXPECT_EQ(kMaxPages + Length(1), large.normal_pages);
-  EXPECT_EQ(Length(0), large.returned_pages);
-  EXPECT_LE(((kMaxPages + Length(1)).raw_num() * 0.03 + 1 * 0.02) /
-                (kMaxPages + Length(2)).raw_num(),
-            avg_age_backed);
-  EXPECT_EQ(0, avg_age_unbacked);
+  EXPECT_EQ(large.spans, 1);
+  EXPECT_EQ(large.normal_pages, kMaxPages + Length(1));
+  EXPECT_EQ(large.returned_pages, Length(0));
+  EXPECT_GE(avg_age_backed,
+            ((kMaxPages + Length(1)).raw_num() * 0.03 + 1 * 0.02) /
+                (kMaxPages + Length(2)).raw_num());
+  EXPECT_EQ(avg_age_unbacked, 0);
 
   ++next;
-  Put({next, Length(2)});
+  SpanAllocInfo info4 = {2, AccessDensityPrediction::kSparse};
+  Put({next, Length(2), info4});
   next += Length(2);
   absl::SleepFor(absl::Milliseconds(30));
   Helper::Stat(tracker_, &small_backed, &small_unbacked, &large,
                &avg_age_backed, &avg_age_unbacked);
   EXPECT_THAT(small_backed, testing::ElementsAre(Length(1), Length(2)));
   EXPECT_THAT(small_unbacked, testing::ElementsAre());
-  EXPECT_EQ(1, large.spans);
-  EXPECT_EQ(kMaxPages + Length(1), large.normal_pages);
-  EXPECT_EQ(Length(0), large.returned_pages);
-  EXPECT_LE(((kMaxPages + Length(1)).raw_num() * 0.06 + 1 * 0.05 + 2 * 0.03) /
-                (kMaxPages + Length(4)).raw_num(),
-            avg_age_backed);
-  EXPECT_EQ(0, avg_age_unbacked);
+  EXPECT_EQ(large.spans, 1);
+  EXPECT_EQ(large.normal_pages, kMaxPages + Length(1));
+  EXPECT_EQ(large.returned_pages, Length(0));
+  EXPECT_GE(avg_age_backed,
+            ((kMaxPages + Length(1)).raw_num() * 0.06 + 1 * 0.05 + 2 * 0.03) /
+                (kMaxPages + Length(4)).raw_num());
+  EXPECT_EQ(avg_age_unbacked, 0);
 
   ++next;
-  Put({next, Length(3)});
+  SpanAllocInfo info5 = {3, AccessDensityPrediction::kSparse};
+  Put({next, Length(3), info5});
   next += Length(3);
   ASSERT_LE(next, end);
   absl::SleepFor(absl::Milliseconds(40));
@@ -541,19 +577,19 @@ TEST_F(PageTrackerTest, Stats) {
   EXPECT_THAT(small_backed,
               testing::ElementsAre(Length(1), Length(2), Length(3)));
   EXPECT_THAT(small_unbacked, testing::ElementsAre());
-  EXPECT_EQ(1, large.spans);
-  EXPECT_EQ(kMaxPages + Length(1), large.normal_pages);
-  EXPECT_EQ(Length(0), large.returned_pages);
-  EXPECT_LE(((kMaxPages + Length(1)).raw_num() * 0.10 + 1 * 0.09 + 2 * 0.07 +
-             3 * 0.04) /
-                (kMaxPages + Length(7)).raw_num(),
-            avg_age_backed);
-  EXPECT_EQ(0, avg_age_unbacked);
+  EXPECT_EQ(large.spans, 1);
+  EXPECT_EQ(large.normal_pages, kMaxPages + Length(1));
+  EXPECT_EQ(large.returned_pages, Length(0));
+  EXPECT_GE(avg_age_backed, ((kMaxPages + Length(1)).raw_num() * 0.10 +
+                             1 * 0.09 + 2 * 0.07 + 3 * 0.04) /
+                                (kMaxPages + Length(7)).raw_num());
+  EXPECT_EQ(avg_age_unbacked, 0);
 
-  ExpectPages({p, kMaxPages + Length(1)});
-  ExpectPages({p + kMaxPages + Length(2), Length(1)});
-  ExpectPages({p + kMaxPages + Length(4), Length(2)});
-  ExpectPages({p + kMaxPages + Length(7), Length(3)});
+  n = kMaxPages + Length(1);
+  ExpectPages({p, n, info2});
+  ExpectPages({p + kMaxPages + Length(2), Length(1), info3});
+  ExpectPages({p + kMaxPages + Length(4), Length(2), info4});
+  ExpectPages({p + kMaxPages + Length(7), Length(3), info5});
   EXPECT_EQ(kMaxPages + Length(7), ReleaseFree());
   absl::SleepFor(absl::Milliseconds(100));
   Helper::Stat(tracker_, &small_backed, &small_unbacked, &large,
@@ -561,11 +597,11 @@ TEST_F(PageTrackerTest, Stats) {
   EXPECT_THAT(small_backed, testing::ElementsAre());
   EXPECT_THAT(small_unbacked,
               testing::ElementsAre(Length(1), Length(2), Length(3)));
-  EXPECT_EQ(1, large.spans);
-  EXPECT_EQ(Length(0), large.normal_pages);
-  EXPECT_EQ(kMaxPages + Length(1), large.returned_pages);
-  EXPECT_EQ(0, avg_age_backed);
-  EXPECT_LE(0.1, avg_age_unbacked);
+  EXPECT_EQ(large.spans, 1);
+  EXPECT_EQ(large.normal_pages, Length(0));
+  EXPECT_EQ(large.returned_pages, kMaxPages + Length(1));
+  EXPECT_EQ(avg_age_backed, 0);
+  EXPECT_GT(avg_age_unbacked, 0.099);
 }
 
 TEST_F(PageTrackerTest, b151915873) {
@@ -585,8 +621,9 @@ TEST_F(PageTrackerTest, b151915873) {
 
   std::vector<PAlloc> allocs;
   allocs.reserve(kPagesPerHugePage.raw_num());
+  SpanAllocInfo info = {1, AccessDensityPrediction::kSparse};
   for (int i = 0; i < kPagesPerHugePage.raw_num(); i++) {
-    allocs.push_back(Get(Length(1)));
+    allocs.push_back(Get(Length(1), info));
   }
 
   std::sort(allocs.begin(), allocs.end(),
@@ -609,33 +646,37 @@ TEST_F(PageTrackerTest, b151915873) {
                                   &small.normal_length[kMaxPages.raw_num()]));
 }
 
-class BlockingUnback {
+class BlockingUnback final : public MemoryModifyFunction {
  public:
-  static void Unback(void* p, size_t len) {
+  constexpr BlockingUnback() = default;
+
+  ABSL_MUST_USE_RESULT bool operator()(void* p, size_t len) override {
     if (!mu_) {
-      return;
+      return success_;
     }
 
-    if (counter) {
-      counter->DecrementCount();
+    if (counter_) {
+      counter_->DecrementCount();
     }
 
     mu_->Lock();
     mu_->Unlock();
+    return success_;
   }
 
-  static void set_lock(absl::Mutex* mu) { mu_ = mu; }
+  void set_lock(absl::Mutex* mu) { mu_ = mu; }
 
-  static absl::BlockingCounter* counter;
+  absl::BlockingCounter* counter_ = nullptr;
+  bool success_ = true;
 
  private:
   static thread_local absl::Mutex* mu_;
 };
 
 thread_local absl::Mutex* BlockingUnback::mu_ = nullptr;
-absl::BlockingCounter* BlockingUnback::counter = nullptr;
 
-class FillerTest : public testing::TestWithParam<FillerPartialRerelease> {
+class FillerTest : public testing::TestWithParam<
+                       std::tuple<HugePageFillerAllocsOption, size_t>> {
  protected:
   // Allow tests to modify the clock used by the cache.
   static int64_t FakeClock() { return clock_; }
@@ -646,12 +687,6 @@ class FillerTest : public testing::TestWithParam<FillerPartialRerelease> {
     clock_ += absl::ToDoubleSeconds(d) * GetFakeClockFrequency();
   }
   static void ResetClock() { clock_ = 1234; }
-
-  static void Unback(void* p, size_t len) {}
-
-  // Our templating approach lets us directly override certain functions
-  // and have mocks without virtualization.  It's a bit funky but works.
-  typedef PageTracker<BlockingUnback::Unback> FakeTracker;
 
   // We have backing of one word per (normal-sized) page for our "hugepages".
   std::vector<size_t> backing_;
@@ -678,21 +713,28 @@ class FillerTest : public testing::TestWithParam<FillerPartialRerelease> {
     }
   }
 
-  HugePageFiller<FakeTracker> filler_;
+  HugePageFiller<PageTracker> filler_;
+  BlockingUnback blocking_unback_;
 
   FillerTest()
-      : filler_(GetParam(),
-                Clock{.now = FakeClock, .freq = GetFakeClockFrequency}) {
+      : filler_(Clock{.now = FakeClock, .freq = GetFakeClockFrequency},
+                /*separate_allocs_for_sparse_and_dense_spans=*/
+                std::get<0>(GetParam()),
+                /*chunks_per_alloc=*/std::get<1>(GetParam()),
+                blocking_unback_) {
     ResetClock();
+    // Reset success state
+    blocking_unback_.success_ = true;
   }
 
-  ~FillerTest() override { EXPECT_EQ(NHugePages(0), filler_.size()); }
+  ~FillerTest() override { EXPECT_EQ(filler_.size(), NHugePages(0)); }
 
   struct PAlloc {
-    FakeTracker* pt;
+    PageTracker* pt;
     PageId p;
     Length n;
     size_t mark;
+    SpanAllocInfo span_alloc_info;
   };
 
   void Mark(const PAlloc& alloc) { MarkRange(alloc.p, alloc.n, alloc.mark); }
@@ -705,69 +747,48 @@ class FillerTest : public testing::TestWithParam<FillerPartialRerelease> {
   Length total_allocated_{0};
 
   absl::InsecureBitGen gen_;
+  // We usually choose the number of objects per span at random, but in tests
+  // where the output is hardcoded, we disable randomization through the
+  // variable below.
+  bool randomize_density_ = true;
 
   void CheckStats() {
-    EXPECT_EQ(hp_contained_, filler_.size());
+    EXPECT_EQ(filler_.size(), hp_contained_);
     auto stats = filler_.stats();
     const uint64_t freelist_bytes = stats.free_bytes + stats.unmapped_bytes;
     const uint64_t used_bytes = stats.system_bytes - freelist_bytes;
-    EXPECT_EQ(total_allocated_.in_bytes(), used_bytes);
-    EXPECT_EQ((hp_contained_.in_pages() - total_allocated_).in_bytes(),
-              freelist_bytes);
-  }
-  PAlloc AllocateRaw(Length n, bool donated = false) {
-    EXPECT_LT(n, kPagesPerHugePage);
-    PAlloc ret;
-    ret.n = n;
-    ret.pt = nullptr;
-    ret.mark = ++next_mark_;
-    if (!donated) {  // Donated means always create a new hugepage
-      absl::base_internal::SpinLockHolder l(&pageheap_lock);
-      auto [pt, page] = filler_.TryGet(n);
-      ret.pt = pt;
-      ret.p = page;
-    }
-    if (ret.pt == nullptr) {
-      ret.pt =
-          new FakeTracker(GetBacking(), absl::base_internal::CycleClock::Now());
-      {
-        absl::base_internal::SpinLockHolder l(&pageheap_lock);
-        ret.p = ret.pt->Get(n).page;
-      }
-      filler_.Contribute(ret.pt, donated);
-      ++hp_contained_;
-    }
-
-    total_allocated_ += n;
-    return ret;
+    EXPECT_EQ(used_bytes, total_allocated_.in_bytes());
+    EXPECT_EQ(freelist_bytes,
+              (hp_contained_.in_pages() - total_allocated_).in_bytes());
   }
 
-  PAlloc Allocate(Length n, bool donated = false) {
+  PAlloc AllocateWithSpanAllocInfo(Length n, SpanAllocInfo span_alloc_info,
+                                   bool donated = false) {
     CHECK_CONDITION(n <= kPagesPerHugePage);
-    PAlloc ret = AllocateRaw(n, donated);
+    PAlloc ret = AllocateRaw(n, span_alloc_info, donated);
     ret.n = n;
     Mark(ret);
     CheckStats();
     return ret;
   }
 
-  // Returns true iff the filler returned an empty hugepage.
-  bool DeleteRaw(const PAlloc& p) {
-    FakeTracker* pt;
-    {
-      absl::base_internal::SpinLockHolder l(&pageheap_lock);
-      pt = filler_.Put(p.pt, p.p, p.n);
-    }
-    total_allocated_ -= p.n;
-    if (pt != nullptr) {
-      EXPECT_EQ(kPagesPerHugePage, pt->longest_free_range());
-      EXPECT_TRUE(pt->empty());
-      --hp_contained_;
-      delete pt;
-      return true;
-    }
+  PAlloc Allocate(Length n, bool donated = false) {
+    CHECK_CONDITION(n <= kPagesPerHugePage);
+    PAlloc ret;
+    size_t objects =
+        randomize_density_ ? (1 << absl::Uniform<size_t>(gen_, 0, 8)) : 1;
 
-    return false;
+    AccessDensityPrediction density =
+        randomize_density_
+            ? (absl::Bernoulli(gen_, 0.5) ? AccessDensityPrediction::kSparse
+                                          : AccessDensityPrediction::kDense)
+            : AccessDensityPrediction::kSparse;
+    SpanAllocInfo info = {.objects_per_span = objects, .density = density};
+    ret = AllocateRaw(n, info, donated);
+    ret.n = n;
+    Mark(ret);
+    CheckStats();
+    return ret;
   }
 
   // Returns true iff the filler returned an empty hugepage
@@ -778,21 +799,89 @@ class FillerTest : public testing::TestWithParam<FillerPartialRerelease> {
     return r;
   }
 
-  Length ReleasePages(Length desired, absl::Duration d = absl::ZeroDuration()) {
+  Length ReleasePages(Length desired, SkipSubreleaseIntervals intervals = {}) {
     absl::base_internal::SpinLockHolder l(&pageheap_lock);
-    return filler_.ReleasePages(desired, d, false);
+    return filler_.ReleasePages(desired, intervals,
+                                /*release_partial_alloc_pages=*/false,
+                                /*hit_limit=*/false);
+  }
+
+  Length ReleasePartialPages(Length desired,
+                             SkipSubreleaseIntervals intervals = {}) {
+    absl::base_internal::SpinLockHolder l(&pageheap_lock);
+    return filler_.ReleasePages(desired, intervals,
+                                /*release_partial_alloc_pages=*/true,
+                                /*hit_limit=*/false);
   }
 
   Length HardReleasePages(Length desired) {
     absl::base_internal::SpinLockHolder l(&pageheap_lock);
-    return filler_.ReleasePages(desired, absl::ZeroDuration(), true);
+    return filler_.ReleasePages(desired, SkipSubreleaseIntervals{},
+                                /*release_partial_alloc_pages=*/false,
+                                /*hit_limit=*/true);
   }
 
   // Generates an "interesting" pattern of allocations that highlights all the
   // various features of our stats.
   std::vector<PAlloc> GenerateInterestingAllocs();
 
+  // Tests fragmentation
+  void FragmentationTest();
+
  private:
+  PAlloc AllocateRaw(Length n, SpanAllocInfo span_alloc_info, bool donated) {
+    EXPECT_LT(n, kPagesPerHugePage);
+    // Densely-accessed spans are not allocated from donated hugepages.  So
+    // assert that we do not test such a situation.
+    EXPECT_TRUE(std::get<0>(GetParam()) ==
+                    HugePageFillerAllocsOption::kUnifiedAllocs ||
+                (!donated ||
+                 span_alloc_info.density == AccessDensityPrediction::kSparse));
+    PAlloc ret;
+    ret.n = n;
+    ret.pt = nullptr;
+    ret.mark = ++next_mark_;
+    ret.span_alloc_info = span_alloc_info;
+    if (!donated) {  // Donated means always create a new hugepage
+      absl::base_internal::SpinLockHolder l(&pageheap_lock);
+      auto [pt, page] = filler_.TryGet(n, span_alloc_info);
+      ret.pt = pt;
+      ret.p = page;
+    }
+    if (ret.pt == nullptr) {
+      ret.pt = new PageTracker(GetBacking(),
+                               absl::base_internal::CycleClock::Now(), donated);
+      {
+        absl::base_internal::SpinLockHolder l(&pageheap_lock);
+        ret.p = ret.pt->Get(n).page;
+      }
+      filler_.Contribute(ret.pt, donated, span_alloc_info);
+      ++hp_contained_;
+    }
+
+    total_allocated_ += n;
+    return ret;
+  }
+
+  // Returns true iff the filler returned an empty hugepage.
+  bool DeleteRaw(const PAlloc& p) {
+    PageTracker* pt;
+    {
+      absl::base_internal::SpinLockHolder l(&pageheap_lock);
+      pt = filler_.Put(p.pt, p.p, p.n);
+    }
+    total_allocated_ -= p.n;
+    if (pt != nullptr) {
+      EXPECT_EQ(pt->longest_free_range(), kPagesPerHugePage);
+      EXPECT_TRUE(pt->empty());
+      --hp_contained_;
+      delete pt;
+      return true;
+    }
+
+    return false;
+  }
+
   static int64_t clock_;
 };
 
@@ -800,23 +889,29 @@ int64_t FillerTest::clock_{1234};
 
 TEST_P(FillerTest, Density) {
   absl::BitGen rng;
-  // Start with a really annoying setup: some hugepages half
-  // empty (randomly)
+  // Start with a really annoying setup: some hugepages half empty (randomly)
   std::vector<PAlloc> allocs;
   std::vector<PAlloc> doomed_allocs;
   static const HugeLength kNumHugePages = NHugePages(64);
   for (auto i = Length(0); i < kNumHugePages.in_pages(); ++i) {
-    ASSERT_EQ(i, filler_.pages_allocated());
+    ASSERT_EQ(filler_.pages_allocated(), i);
+    PAlloc p = Allocate(Length(1));
     if (absl::Bernoulli(rng, 1.0 / 2)) {
-      allocs.push_back(Allocate(Length(1)));
+      allocs.push_back(p);
     } else {
-      doomed_allocs.push_back(Allocate(Length(1)));
+      doomed_allocs.push_back(p);
     }
   }
   for (auto d : doomed_allocs) {
     Delete(d);
   }
-  EXPECT_EQ(kNumHugePages, filler_.size());
+  const HugePageFillerAllocsOption path = std::get<0>(GetParam());
+  if (path == HugePageFillerAllocsOption::kUnifiedAllocs) {
+    EXPECT_EQ(filler_.size(), kNumHugePages);
+  } else {
+    EXPECT_LE(filler_.size(), kNumHugePages + NHugePages(1));
+    EXPECT_GE(filler_.size(), kNumHugePages);
+  }
   // We want a good chance of touching ~every allocation.
   size_t n = allocs.size();
   // Now, randomly add and delete to the allocations.
@@ -827,60 +922,202 @@ TEST_P(FillerTest, Density) {
     for (int i = 0; i < n; ++i) {
       Delete(allocs[i]);
       allocs[i] = Allocate(Length(1));
-      ASSERT_EQ(Length(n), filler_.pages_allocated());
+      ASSERT_EQ(filler_.pages_allocated(), Length(n));
     }
   }
 
-  EXPECT_GE(allocs.size() / kPagesPerHugePage.raw_num() + 1,
+  EXPECT_GE(allocs.size() / kPagesPerHugePage.raw_num() + 3,
             filler_.size().raw_num());
 
   // clean up, check for failures
   for (auto a : allocs) {
     Delete(a);
-    ASSERT_EQ(Length(--n), filler_.pages_allocated());
+    ASSERT_EQ(filler_.pages_allocated(), Length(--n));
   }
 }
 
-TEST_P(FillerTest, Release) {
+// This test makes sure that we continue releasing from regular (non-partial)
+// allocs when we enable a feature to release all free pages from partial
+// allocs.
+TEST_P(FillerTest, ReleaseFromFullAllocs) {
   static const Length kAlloc = kPagesPerHugePage / 2;
+  // Maintain the object count for the second allocation so that the alloc list
+  // remains the same for the two allocations.
   PAlloc p1 = Allocate(kAlloc - Length(1));
-  PAlloc p2 = Allocate(kAlloc + Length(1));
+  PAlloc p2 = AllocateWithSpanAllocInfo(kAlloc + Length(1), p1.span_alloc_info);
 
   PAlloc p3 = Allocate(kAlloc - Length(2));
-  PAlloc p4 = Allocate(kAlloc + Length(2));
+  PAlloc p4 = AllocateWithSpanAllocInfo(kAlloc + Length(2), p3.span_alloc_info);
   // We have two hugepages, both full: nothing to release.
-  ASSERT_EQ(Length(0), ReleasePages(kMaxValidPages));
+  ASSERT_EQ(ReleasePartialPages(kMaxValidPages), Length(0));
   Delete(p1);
   Delete(p3);
   // Now we should see the p1 hugepage - emptier - released.
-  ASSERT_EQ(kAlloc - Length(1), ReleasePages(kAlloc - Length(1)));
-  EXPECT_EQ(kAlloc - Length(1), filler_.unmapped_pages());
+  ASSERT_EQ(ReleasePartialPages(kAlloc - Length(1)), kAlloc - Length(1));
+  EXPECT_EQ(filler_.unmapped_pages(), kAlloc - Length(1));
   ASSERT_TRUE(p1.pt->released());
   ASSERT_FALSE(p3.pt->released());
 
+  // Check subrelease stats.
+  SubreleaseStats subrelease = filler_.subrelease_stats();
+  EXPECT_EQ(subrelease.num_pages_subreleased, kAlloc - Length(1));
+  EXPECT_EQ(subrelease.num_partial_alloc_pages_subreleased, Length(0));
+
   // We expect to reuse p1.pt.
-  PAlloc p5 = Allocate(kAlloc - Length(1));
-  ASSERT_TRUE(p1.pt == p5.pt || p3.pt == p5.pt);
+  PAlloc p5 = AllocateWithSpanAllocInfo(kAlloc - Length(1), p1.span_alloc_info);
+  ASSERT_TRUE(p1.pt == p5.pt);
 
   Delete(p2);
   Delete(p4);
   Delete(p5);
 }
 
-TEST_P(FillerTest, Fragmentation) {
+// This test makes sure that we release all the free pages from partial allocs
+// even when we request fewer pages to release. It also confirms that we
+// continue to release desired number of pages from the full allocs even when
+// release_partial_alloc_pages option is enabled.
+TEST_P(FillerTest, ReleaseFreePagesInPartialAllocs) {
+  static const Length kAlloc = kPagesPerHugePage / 2;
+  static const Length kL1 = kAlloc - Length(1);
+  static const Length kL2 = kAlloc + Length(1);
+
+  static const Length kL3 = kAlloc - Length(1);
+  static const Length kL4 = kAlloc + Length(1);
+  PAlloc p1 = Allocate(kL1);
+  PAlloc p2 = AllocateWithSpanAllocInfo(kL2, p1.span_alloc_info);
+  PAlloc p3 = Allocate(kL3);
+  PAlloc p4 = AllocateWithSpanAllocInfo(kL4, p3.span_alloc_info);
+
+  // As there are no free pages, we shouldn't be able to release anything.
+  EXPECT_EQ(ReleasePartialPages(kMaxValidPages), Length(0));
+
+  Delete(p2);
+  Delete(p4);
+
+  // Check subrelease stats.
+  SubreleaseStats subrelease = filler_.subrelease_stats();
+  EXPECT_EQ(subrelease.num_pages_subreleased, Length(0));
+  EXPECT_EQ(subrelease.num_partial_alloc_pages_subreleased, Length(0));
+
+  // As we do not have any pages in partially-released lists, we should continue
+  // to release the requested number of pages.
+  EXPECT_EQ(filler_.used_pages_in_partial_released(), Length(0));
+  EXPECT_EQ(ReleasePartialPages(kL2), kL2);
+  EXPECT_EQ(ReleasePartialPages(kL4), kL4);
+
+  // Check subrelease stats.
+  subrelease = filler_.subrelease_stats();
+  EXPECT_EQ(subrelease.num_pages_subreleased, kL2 + kL4);
+  EXPECT_EQ(subrelease.num_partial_alloc_pages_subreleased, Length(0));
+  // Now we allocate more.
+  static const Length kL5 = kL2 - Length(2);
+  static const Length kL6 = kL4 - Length(2);
+  PAlloc p5 = AllocateWithSpanAllocInfo(kL5, p1.span_alloc_info);
+  PAlloc p6 = AllocateWithSpanAllocInfo(kL6, p3.span_alloc_info);
+  EXPECT_EQ(filler_.used_pages_in_released(), kL1 + kL3 + kL5 + kL6);
+  EXPECT_EQ(filler_.used_pages_in_partial_released(), Length(0));
+
+  Delete(p5);
+  Delete(p6);
+
+  // We have some free pages in partially-released allocs now.
+  EXPECT_EQ(filler_.used_pages_in_partial_released(), kL1 + kL3);
+  // We should release all the free pages from partially-released allocs at
+  // once. The second call to ReleasePartialPages should find nothing.
+  EXPECT_EQ(ReleasePartialPages(kL5), kL5 + kL6);
+  EXPECT_EQ(ReleasePartialPages(kL5), Length(0));
+
+  // Check subrelease stats.
+  subrelease = filler_.subrelease_stats();
+  EXPECT_EQ(subrelease.num_pages_subreleased, kL5 + kL6);
+  EXPECT_EQ(subrelease.num_partial_alloc_pages_subreleased, kL5 + kL6);
+
+  Delete(p1);
+  Delete(p3);
+}
+
+TEST_P(FillerTest, AccountingForUsedPartialReleased) {
+  static const Length kAlloc = kPagesPerHugePage / 2;
+  static const Length kL1 = kAlloc + Length(3);
+  static const Length kL2 = kAlloc + Length(5);
+  PAlloc p1 = Allocate(kL1);
+  PAlloc p2 = Allocate(kL2);
+  // We have two hugepages, both partially allocated.
+  ASSERT_EQ(ReleasePages(kMaxValidPages),
+            kPagesPerHugePage - kL1 + kPagesPerHugePage - kL2);
+  ASSERT_EQ(filler_.used_pages_in_released(), kL1 + kL2);
+  // Now we allocate more.
+  static const Length kL3 = kAlloc - Length(4);
+  static const Length kL4 = kAlloc - Length(7);
+  // Maintain the object count as above so that same alloc lists are used for
+  // the following two allocations.
+  PAlloc p3 = AllocateWithSpanAllocInfo(kL3, p1.span_alloc_info);
+  PAlloc p4 = AllocateWithSpanAllocInfo(kL4, p2.span_alloc_info);
+  EXPECT_EQ(filler_.used_pages_in_released(), kL1 + kL2 + kL3 + kL4);
+  Delete(p3);
+  Delete(p4);
+  EXPECT_EQ(filler_.used_pages_in_partial_released(), kL1 + kL2);
+  EXPECT_EQ(filler_.used_pages_in_released(), Length(0));
+  Delete(p1);
+  Delete(p2);
+}
+
+TEST_P(FillerTest, Release) {
+  static const Length kAlloc = kPagesPerHugePage / 2;
+  // Maintain the object count for the second allocation so that the alloc list
+  // remains the same for the two allocations.
+  PAlloc p1 = Allocate(kAlloc - Length(1));
+  PAlloc p2 = AllocateWithSpanAllocInfo(kAlloc + Length(1), p1.span_alloc_info);
+
+  PAlloc p3 = Allocate(kAlloc - Length(2));
+  PAlloc p4 = AllocateWithSpanAllocInfo(kAlloc + Length(2), p3.span_alloc_info);
+  // We have two hugepages, both full: nothing to release.
+  ASSERT_EQ(ReleasePages(kMaxValidPages), Length(0));
+  Delete(p1);
+  Delete(p3);
+  // Now we should see the p1 hugepage - emptier - released.
+  ASSERT_EQ(ReleasePages(kAlloc - Length(1)), kAlloc - Length(1));
+  EXPECT_EQ(filler_.unmapped_pages(), kAlloc - Length(1));
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(0));
+  ASSERT_TRUE(p1.pt->released());
+  ASSERT_FALSE(p3.pt->released());
+
+  // We expect to reuse p1.pt.
+  PAlloc p5 = AllocateWithSpanAllocInfo(kAlloc - Length(1), p1.span_alloc_info);
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(1));
+  ASSERT_TRUE(p1.pt == p5.pt);
+
+  Delete(p2);
+  Delete(p4);
+  Delete(p5);
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(0));
+}
+
+TEST_P(FillerTest, ReleaseZero) {
+  // Trying to release no pages should not crash.
+  EXPECT_EQ(
+      ReleasePages(Length(0),
+                   SkipSubreleaseIntervals{.peak_interval = absl::Seconds(1)}),
+      Length(0));
+}
+
+void FillerTest::FragmentationTest() {
+  constexpr Length kRequestLimit = Length(32);
+  constexpr Length kSizeLimit = Length(512 * 1024);
+  constexpr size_t kReps = 1000;
+
   absl::BitGen rng;
-  auto dist = EmpiricalDistribution(absl::GetFlag(FLAGS_frag_req_limit));
+  auto dist = EmpiricalDistribution(kRequestLimit);
 
   std::vector<PAlloc> allocs;
   Length total;
-  while (total < absl::GetFlag(FLAGS_frag_size)) {
+  while (total < kSizeLimit) {
     auto n = Length(dist(rng));
     total += n;
-    allocs.push_back(AllocateRaw(n));
+    allocs.push_back(Allocate(n));
   }
 
   double max_slack = 0.0;
-  const size_t kReps = absl::GetFlag(FLAGS_frag_iters);
   for (size_t i = 0; i < kReps; ++i) {
     auto stats = filler_.stats();
     double slack = static_cast<double>(stats.free_bytes) / stats.system_bytes;
@@ -893,22 +1130,24 @@ TEST_P(FillerTest, Fragmentation) {
     if (absl::Bernoulli(rng, 1.0 / 2)) {
       size_t index = absl::Uniform<int32_t>(rng, 0, allocs.size());
       std::swap(allocs[index], allocs.back());
-      DeleteRaw(allocs.back());
+      Delete(allocs.back());
       total -= allocs.back().n;
       allocs.pop_back();
     } else {
       auto n = Length(dist(rng));
-      allocs.push_back(AllocateRaw(n));
+      allocs.push_back(Allocate(n));
       total += n;
     }
   }
 
-  EXPECT_LE(max_slack, 0.05);
+  EXPECT_LE(max_slack, 0.06);
 
   for (auto a : allocs) {
-    DeleteRaw(a);
+    Delete(a);
   }
 }
+
+TEST_P(FillerTest, Fragmentation) { FragmentationTest(); }
 
 TEST_P(FillerTest, PrintFreeRatio) {
   // This test is sensitive to the number of pages per hugepage, as we are
@@ -917,20 +1156,26 @@ TEST_P(FillerTest, PrintFreeRatio) {
     GTEST_SKIP();
   }
 
+  // We prevent randomly choosing the number of objects per span since this
+  // test has hardcoded output which will change if the objects per span are
+  // chosen at random.
+  randomize_density_ = false;
+
   // Allocate two huge pages, release one, verify that we do not get an invalid
   // (>1.) ratio of free : non-fulls.
 
   // First huge page
   PAlloc a1 = Allocate(kPagesPerHugePage / 2);
-  PAlloc a2 = Allocate(kPagesPerHugePage / 2);
+  PAlloc a2 =
+      AllocateWithSpanAllocInfo(kPagesPerHugePage / 2, a1.span_alloc_info);
 
   // Second huge page
   constexpr Length kQ = kPagesPerHugePage / 4;
 
   PAlloc a3 = Allocate(kQ);
-  PAlloc a4 = Allocate(kQ);
-  PAlloc a5 = Allocate(kQ);
-  PAlloc a6 = Allocate(kQ);
+  PAlloc a4 = AllocateWithSpanAllocInfo(kQ, a3.span_alloc_info);
+  PAlloc a5 = AllocateWithSpanAllocInfo(kQ, a3.span_alloc_info);
+  PAlloc a6 = AllocateWithSpanAllocInfo(kQ, a3.span_alloc_info);
 
   Delete(a6);
 
@@ -945,29 +1190,17 @@ TEST_P(FillerTest, PrintFreeRatio) {
     buffer.erase(printer.SpaceRequired());
   }
 
-  if (GetParam() == FillerPartialRerelease::Retain) {
-    EXPECT_THAT(
-        buffer,
-        testing::StartsWith(
-            R"(HugePageFiller: densely pack small requests into hugepages
-HugePageFiller: 2 total, 1 full, 0 partial, 1 released (1 partially), 0 quarantined
+  EXPECT_THAT(buffer,
+              testing::StartsWith(
+                  R"(HugePageFiller: densely pack small requests into hugepages
+HugePageFiller: Overall, 2 total, 1 full, 0 partial, 1 released (1 partially), 0 quarantined
+HugePageFiller: those with sparsely-accessed spans, 2 total, 1 full, 0 partial, 1 released (1 partially), 0 quarantined
+HugePageFiller: those with densely-accessed spans, 0 total, 0 full, 0 partial, 0 released (0 partially), 0 quarantined
 HugePageFiller: 64 pages free in 2 hugepages, 0.1250 free
 HugePageFiller: among non-fulls, 0.2500 free
 HugePageFiller: 128 used pages in subreleased hugepages (128 of them in partially released)
 HugePageFiller: 1 hugepages partially released, 0.2500 released
 HugePageFiller: 0.6667 of used pages hugepageable)"));
-  } else {
-    EXPECT_THAT(
-        buffer,
-        testing::StartsWith(
-            R"(HugePageFiller: densely pack small requests into hugepages
-HugePageFiller: 2 total, 1 full, 0 partial, 1 released (0 partially), 0 quarantined
-HugePageFiller: 0 pages free in 2 hugepages, 0.0000 free
-HugePageFiller: among non-fulls, 0.0000 free
-HugePageFiller: 128 used pages in subreleased hugepages (0 of them in partially released)
-HugePageFiller: 1 hugepages partially released, 0.5000 released
-HugePageFiller: 0.6667 of used pages hugepageable)"));
-  }
 
   // Cleanup remaining allocs.
   Delete(a1);
@@ -990,47 +1223,47 @@ TEST_P(FillerTest, HugePageFrac) {
   static const Length kQ = kPagesPerHugePage / 4;
   // These are all on one page:
   auto a1 = Allocate(kQ);
-  auto a2 = Allocate(kQ);
-  auto a3 = Allocate(kQ - Length(1));
-  auto a4 = Allocate(kQ + Length(1));
+  auto a2 = AllocateWithSpanAllocInfo(kQ, a1.span_alloc_info);
+  auto a3 = AllocateWithSpanAllocInfo(kQ - Length(1), a1.span_alloc_info);
+  auto a4 = AllocateWithSpanAllocInfo(kQ + Length(1), a1.span_alloc_info);
 
   // As are these:
   auto a5 = Allocate(kPagesPerHugePage - kQ);
-  auto a6 = Allocate(kQ);
+  auto a6 = AllocateWithSpanAllocInfo(kQ, a5.span_alloc_info);
 
-  EXPECT_EQ(1, filler_.hugepage_frac());
+  EXPECT_EQ(filler_.hugepage_frac(), 1);
   // Free space doesn't affect it...
   Delete(a4);
   Delete(a6);
 
-  EXPECT_EQ(1, filler_.hugepage_frac());
+  EXPECT_EQ(filler_.hugepage_frac(), 1);
 
   // Releasing the hugepage does.
-  ASSERT_EQ(kQ + Length(1), ReleasePages(kQ + Length(1)));
-  EXPECT_EQ((3.0 * kQ.raw_num()) / (6.0 * kQ.raw_num() - 1.0),
-            filler_.hugepage_frac());
+  ASSERT_EQ(ReleasePages(kQ + Length(1)), kQ + Length(1));
+  EXPECT_EQ(filler_.hugepage_frac(),
+            (3.0 * kQ.raw_num()) / (6.0 * kQ.raw_num() - 1.0));
 
   // Check our arithmetic in a couple scenarios.
 
   // 2 kQs on the release and 3 on the hugepage
   Delete(a2);
-  EXPECT_EQ((3.0 * kQ.raw_num()) / (5.0 * kQ.raw_num() - 1),
-            filler_.hugepage_frac());
+  EXPECT_EQ(filler_.hugepage_frac(),
+            (3.0 * kQ.raw_num()) / (5.0 * kQ.raw_num() - 1));
   // This releases the free page on the partially released hugepage.
-  ASSERT_EQ(kQ, ReleasePages(kQ));
-  EXPECT_EQ((3.0 * kQ.raw_num()) / (5.0 * kQ.raw_num() - 1),
-            filler_.hugepage_frac());
+  ASSERT_EQ(ReleasePages(kQ), kQ);
+  EXPECT_EQ(filler_.hugepage_frac(),
+            (3.0 * kQ.raw_num()) / (5.0 * kQ.raw_num() - 1));
 
   // just-over-1 kQ on the release and 3 on the hugepage
   Delete(a3);
-  EXPECT_EQ((3 * kQ.raw_num()) / (4.0 * kQ.raw_num()), filler_.hugepage_frac());
+  EXPECT_EQ(filler_.hugepage_frac(), (3 * kQ.raw_num()) / (4.0 * kQ.raw_num()));
   // This releases the free page on the partially released hugepage.
-  ASSERT_EQ(kQ - Length(1), ReleasePages(kQ - Length(1)));
-  EXPECT_EQ((3 * kQ.raw_num()) / (4.0 * kQ.raw_num()), filler_.hugepage_frac());
+  ASSERT_EQ(ReleasePages(kQ - Length(1)), kQ - Length(1));
+  EXPECT_EQ(filler_.hugepage_frac(), (3 * kQ.raw_num()) / (4.0 * kQ.raw_num()));
 
   // All huge!
   Delete(a1);
-  EXPECT_EQ(1, filler_.hugepage_frac());
+  EXPECT_EQ(filler_.hugepage_frac(), 1);
 
   Delete(a5);
 }
@@ -1051,12 +1284,12 @@ TEST_P(FillerTest, DISABLED_ReleaseFrac) {
 
   std::vector<PAlloc> allocs;
   while (filler_.used_pages() < baseline) {
-    allocs.push_back(AllocateRaw(Length(1)));
+    allocs.push_back(Allocate(Length(1)));
   }
 
   while (true) {
     while (filler_.used_pages() < peak) {
-      allocs.push_back(AllocateRaw(Length(1)));
+      allocs.push_back(Allocate(Length(1)));
     }
     const double peak_frac = filler_.hugepage_frac();
     // VSS
@@ -1067,7 +1300,7 @@ TEST_P(FillerTest, DISABLED_ReleaseFrac) {
     size_t limit = allocs.size();
     while (filler_.used_pages() > baseline) {
       --limit;
-      DeleteRaw(allocs[limit]);
+      Delete(allocs[limit]);
     }
     allocs.resize(limit);
     while (filler_.free_pages() > free_target) {
@@ -1080,118 +1313,235 @@ TEST_P(FillerTest, DISABLED_ReleaseFrac) {
   }
 }
 
-TEST_P(FillerTest, ReleaseAccounting) {
+// Make sure we release appropriate number of pages when using
+// ReleasePartialPages.
+TEST_P(FillerTest, ReleasePagesFromPartialAllocs) {
   const Length N = kPagesPerHugePage;
   auto big = Allocate(N - Length(2));
-  auto tiny1 = Allocate(Length(1));
-  auto tiny2 = Allocate(Length(1));
+  auto tiny1 = AllocateWithSpanAllocInfo(Length(1), big.span_alloc_info);
+  auto tiny2 = AllocateWithSpanAllocInfo(Length(1), big.span_alloc_info);
   auto half1 = Allocate(N / 2);
-  auto half2 = Allocate(N / 2);
+  auto half2 = AllocateWithSpanAllocInfo(N / 2, half1.span_alloc_info);
 
   Delete(half1);
   Delete(big);
 
-  ASSERT_EQ(NHugePages(2), filler_.size());
+  ASSERT_EQ(filler_.size(), NHugePages(2));
 
   // We should pick the [empty big][full tiny] hugepage here.
-  EXPECT_EQ(N - Length(2), ReleasePages(N - Length(2)));
-  EXPECT_EQ(N - Length(2), filler_.unmapped_pages());
+  EXPECT_EQ(ReleasePartialPages(N - Length(2)), N - Length(2));
+  EXPECT_EQ(filler_.unmapped_pages(), N - Length(2));
+  // This shouldn't trigger a release.
+  Delete(tiny1);
+  EXPECT_EQ(filler_.unmapped_pages(), N - Length(2));
+  // Until we call ReleasePartialPages() again.
+  EXPECT_EQ(ReleasePartialPages(Length(1)), Length(1));
+
+  // As should this, but this will drop the whole hugepage.
+  Delete(tiny2);
+  EXPECT_EQ(filler_.unmapped_pages(), Length(0));
+  EXPECT_EQ(filler_.size(), NHugePages(1));
+
+  // We should release tiny2 here.
+  EXPECT_EQ(ReleasePartialPages(Length(1)), Length(1));
+  EXPECT_EQ(filler_.unmapped_pages(), Length(0));
+  EXPECT_EQ(filler_.size(), NHugePages(1));
+
+  // Check subrelease stats.
+  EXPECT_EQ(filler_.used_pages(), N / 2);
+  EXPECT_EQ(filler_.used_pages_in_any_subreleased(), Length(0));
+  EXPECT_EQ(filler_.used_pages_in_partial_released(), Length(0));
+  EXPECT_EQ(filler_.used_pages_in_released(), Length(0));
+
+  // Now we pick the half/half hugepage. We should be able to release pages from
+  // full allocs with ReleasePartialPages even though partially-released allocs
+  // are empty.
+  EXPECT_EQ(ReleasePartialPages(kMaxValidPages), N / 2);
+  EXPECT_EQ(filler_.unmapped_pages(), N / 2);
+
+  // Check subrelease stats.
+  EXPECT_EQ(filler_.used_pages(), N / 2);
+  EXPECT_EQ(filler_.used_pages_in_any_subreleased(), N / 2);
+  EXPECT_EQ(filler_.used_pages_in_partial_released(), Length(0));
+  EXPECT_EQ(filler_.used_pages_in_released(), N / 2);
+
+  Delete(half2);
+  EXPECT_EQ(filler_.size(), NHugePages(0));
+  EXPECT_EQ(filler_.unmapped_pages(), Length(0));
+}
+
+TEST_P(FillerTest, ReleaseAccounting) {
+  const Length N = kPagesPerHugePage;
+  auto big = Allocate(N - Length(2));
+  auto tiny1 = AllocateWithSpanAllocInfo(Length(1), big.span_alloc_info);
+  auto tiny2 = AllocateWithSpanAllocInfo(Length(1), big.span_alloc_info);
+  auto half1 = Allocate(N / 2);
+  auto half2 = AllocateWithSpanAllocInfo(N / 2, half1.span_alloc_info);
+
+  Delete(half1);
+  Delete(big);
+
+  ASSERT_EQ(filler_.size(), NHugePages(2));
+
+  // We should pick the [empty big][full tiny] hugepage here.
+  EXPECT_EQ(ReleasePages(N - Length(2)), N - Length(2));
+  EXPECT_EQ(filler_.unmapped_pages(), N - Length(2));
   // This shouldn't trigger a release
   Delete(tiny1);
-  if (GetParam() == FillerPartialRerelease::Retain) {
-    EXPECT_EQ(N - Length(2), filler_.unmapped_pages());
-    // Until we call ReleasePages()
-    EXPECT_EQ(Length(1), ReleasePages(Length(1)));
-  }
-  EXPECT_EQ(N - Length(1), filler_.unmapped_pages());
+  EXPECT_EQ(filler_.unmapped_pages(), N - Length(2));
+  // Until we call ReleasePages()
+  EXPECT_EQ(ReleasePages(Length(1)), Length(1));
+  EXPECT_EQ(filler_.unmapped_pages(), N - Length(1));
 
   // As should this, but this will drop the whole hugepage
   Delete(tiny2);
-  EXPECT_EQ(Length(0), filler_.unmapped_pages());
-  EXPECT_EQ(NHugePages(1), filler_.size());
+  EXPECT_EQ(filler_.unmapped_pages(), Length(0));
+  EXPECT_EQ(filler_.size(), NHugePages(1));
 
   // This shouldn't trigger any release: we just claim credit for the
   // releases we did automatically on tiny2.
-  if (GetParam() == FillerPartialRerelease::Retain) {
-    EXPECT_EQ(Length(1), ReleasePages(Length(1)));
-  } else {
-    EXPECT_EQ(Length(2), ReleasePages(Length(2)));
-  }
-  EXPECT_EQ(Length(0), filler_.unmapped_pages());
-  EXPECT_EQ(NHugePages(1), filler_.size());
+  EXPECT_EQ(ReleasePages(Length(1)), Length(1));
+  EXPECT_EQ(filler_.unmapped_pages(), Length(0));
+  EXPECT_EQ(filler_.size(), NHugePages(1));
 
   // Check subrelease stats
-  EXPECT_EQ(N / 2, filler_.used_pages());
-  EXPECT_EQ(Length(0), filler_.used_pages_in_any_subreleased());
-  EXPECT_EQ(Length(0), filler_.used_pages_in_partial_released());
-  EXPECT_EQ(Length(0), filler_.used_pages_in_released());
+  EXPECT_EQ(filler_.used_pages(), N / 2);
+  EXPECT_EQ(filler_.used_pages_in_any_subreleased(), Length(0));
+  EXPECT_EQ(filler_.used_pages_in_partial_released(), Length(0));
+  EXPECT_EQ(filler_.used_pages_in_released(), Length(0));
 
   // Now we pick the half/half hugepage
-  EXPECT_EQ(N / 2, ReleasePages(kMaxValidPages));
-  EXPECT_EQ(N / 2, filler_.unmapped_pages());
+  EXPECT_EQ(ReleasePages(kMaxValidPages), N / 2);
+  EXPECT_EQ(filler_.unmapped_pages(), N / 2);
 
   // Check subrelease stats
-  EXPECT_EQ(N / 2, filler_.used_pages());
-  EXPECT_EQ(N / 2, filler_.used_pages_in_any_subreleased());
-  EXPECT_EQ(Length(0), filler_.used_pages_in_partial_released());
-  EXPECT_EQ(N / 2, filler_.used_pages_in_released());
+  EXPECT_EQ(filler_.used_pages(), N / 2);
+  EXPECT_EQ(filler_.used_pages_in_any_subreleased(), N / 2);
+  EXPECT_EQ(filler_.used_pages_in_partial_released(), Length(0));
+  EXPECT_EQ(filler_.used_pages_in_released(), N / 2);
 
-  // Check accounting for partially released hugepages with partial rerelease
-  if (GetParam() == FillerPartialRerelease::Retain) {
-    // Allocating and deallocating a small object causes the page to turn from
-    // a released hugepage into a partially released hugepage.
-    auto tiny3 = Allocate(Length(1));
-    auto tiny4 = Allocate(Length(1));
-    Delete(tiny4);
-    EXPECT_EQ(N / 2 + Length(1), filler_.used_pages());
-    EXPECT_EQ(N / 2 + Length(1), filler_.used_pages_in_any_subreleased());
-    EXPECT_EQ(N / 2 + Length(1), filler_.used_pages_in_partial_released());
-    EXPECT_EQ(Length(0), filler_.used_pages_in_released());
-    Delete(tiny3);
-  }
+  // Check accounting for partially released hugepages with partial rerelease.
+  // Allocating and deallocating a small object causes the page to turn from a
+  // released hugepage into a partially released hugepage.
+  //
+  // The number of objects for each allocation is same as that for half2 so to
+  // ensure that same alloc list is used.
+  auto tiny3 = AllocateWithSpanAllocInfo(Length(1), half2.span_alloc_info);
+  auto tiny4 = AllocateWithSpanAllocInfo(Length(1), half2.span_alloc_info);
+  Delete(tiny4);
+  EXPECT_EQ(filler_.used_pages(), N / 2 + Length(1));
+  EXPECT_EQ(filler_.used_pages_in_any_subreleased(), N / 2 + Length(1));
+  EXPECT_EQ(filler_.used_pages_in_partial_released(), N / 2 + Length(1));
+  EXPECT_EQ(filler_.used_pages_in_released(), Length(0));
+  Delete(tiny3);
 
   Delete(half2);
-  EXPECT_EQ(NHugePages(0), filler_.size());
-  EXPECT_EQ(Length(0), filler_.unmapped_pages());
+  EXPECT_EQ(filler_.size(), NHugePages(0));
+  EXPECT_EQ(filler_.unmapped_pages(), Length(0));
 }
 
 TEST_P(FillerTest, ReleaseWithReuse) {
   const Length N = kPagesPerHugePage;
   auto half = Allocate(N / 2);
-  auto tiny1 = Allocate(N / 4);
-  auto tiny2 = Allocate(N / 4);
+  auto tiny1 = AllocateWithSpanAllocInfo(N / 4, half.span_alloc_info);
+  auto tiny2 = AllocateWithSpanAllocInfo(N / 4, half.span_alloc_info);
 
   Delete(half);
 
-  ASSERT_EQ(NHugePages(1), filler_.size());
+  ASSERT_EQ(filler_.size(), NHugePages(1));
 
   // We should be able to release the pages from half1.
-  EXPECT_EQ(N / 2, ReleasePages(kMaxValidPages));
-  EXPECT_EQ(N / 2, filler_.unmapped_pages());
+  EXPECT_EQ(ReleasePages(kMaxValidPages), N / 2);
+  EXPECT_EQ(filler_.unmapped_pages(), N / 2);
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(0));
 
   // Release tiny1, release more.
   Delete(tiny1);
 
-  EXPECT_EQ(N / 4, ReleasePages(kMaxValidPages));
-  EXPECT_EQ(3 * N / 4, filler_.unmapped_pages());
+  EXPECT_EQ(ReleasePages(kMaxValidPages), N / 4);
+  EXPECT_EQ(filler_.unmapped_pages(), 3 * N / 4);
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(0));
 
   // Repopulate, confirm we can't release anything and unmapped pages goes to 0.
-  tiny1 = Allocate(N / 4);
+  tiny1 = AllocateWithSpanAllocInfo(N / 4, half.span_alloc_info);
   EXPECT_EQ(Length(0), ReleasePages(kMaxValidPages));
   EXPECT_EQ(N / 2, filler_.unmapped_pages());
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(0));
 
   // Continue repopulating.
-  half = Allocate(N / 2);
-  EXPECT_EQ(Length(0), ReleasePages(kMaxValidPages));
-  EXPECT_EQ(Length(0), filler_.unmapped_pages());
-  EXPECT_EQ(NHugePages(1), filler_.size());
+  half = AllocateWithSpanAllocInfo(N / 2, half.span_alloc_info);
+  EXPECT_EQ(ReleasePages(kMaxValidPages), Length(0));
+  EXPECT_EQ(filler_.unmapped_pages(), Length(0));
+  EXPECT_EQ(filler_.size(), NHugePages(1));
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(1));
 
   // Release everything and cleanup.
   Delete(half);
   Delete(tiny1);
   Delete(tiny2);
-  EXPECT_EQ(NHugePages(0), filler_.size());
-  EXPECT_EQ(Length(0), filler_.unmapped_pages());
+  EXPECT_EQ(filler_.size(), NHugePages(0));
+  EXPECT_EQ(filler_.unmapped_pages(), Length(0));
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(0));
+}
+
+TEST_P(FillerTest, CheckPreviouslyReleasedStats) {
+  const Length N = kPagesPerHugePage;
+  auto half = Allocate(N / 2);
+  auto tiny1 = AllocateWithSpanAllocInfo(N / 4, half.span_alloc_info);
+  auto tiny2 = AllocateWithSpanAllocInfo(N / 4, half.span_alloc_info);
+
+  Delete(half);
+
+  ASSERT_EQ(filler_.size(), NHugePages(1));
+
+  // We should be able to release the pages from half1.
+  EXPECT_EQ(ReleasePages(kMaxValidPages), N / 2);
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(0));
+
+  {
+    std::string buffer(1024 * 1024, '\0');
+    Printer printer(&*buffer.begin(), buffer.size());
+    filler_.Print(&printer, true);
+    buffer.resize(strlen(buffer.c_str()));
+    EXPECT_THAT(
+        buffer,
+        testing::HasSubstr(
+            "HugePageFiller: 0 hugepages were previously released, but later "
+            "became full."));
+  }
+
+  // Repopulate.
+  half = AllocateWithSpanAllocInfo(N / 2, half.span_alloc_info);
+  EXPECT_EQ(ReleasePages(kMaxValidPages), Length(0));
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(1));
+  {
+    std::string buffer(1024 * 1024, '\0');
+    Printer printer(&*buffer.begin(), buffer.size());
+    filler_.Print(&printer, true);
+    buffer.resize(strlen(buffer.c_str()));
+    EXPECT_THAT(
+        buffer,
+        testing::HasSubstr(
+            "HugePageFiller: 1 hugepages were previously released, but later "
+            "became full."));
+  }
+
+  // Release everything and cleanup.
+  Delete(half);
+  Delete(tiny1);
+  Delete(tiny2);
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(0));
+  {
+    std::string buffer(1024 * 1024, '\0');
+    Printer printer(&*buffer.begin(), buffer.size());
+    filler_.Print(&printer, true);
+    buffer.resize(strlen(buffer.c_str()));
+    EXPECT_THAT(
+        buffer,
+        testing::HasSubstr(
+            "HugePageFiller: 0 hugepages were previously released, but later "
+            "became full."));
+  }
 }
 
 TEST_P(FillerTest, AvoidArbitraryQuarantineVMGrowth) {
@@ -1201,12 +1551,12 @@ TEST_P(FillerTest, AvoidArbitraryQuarantineVMGrowth) {
     auto half1 = Allocate(N / 2);
     auto half2 = Allocate(N / 2);
     Delete(half1);
-    ASSERT_EQ(N / 2, ReleasePages(N / 2));
+    ASSERT_EQ(ReleasePages(N / 2), N / 2);
     Delete(half2);
   }
 
   auto s = filler_.stats();
-  EXPECT_GE(1024 * 1024 * 1024, s.system_bytes);
+  EXPECT_LE(s.system_bytes, 1024 * 1024 * 1024);
 }
 
 TEST_P(FillerTest, StronglyPreferNonDonated) {
@@ -1216,13 +1566,21 @@ TEST_P(FillerTest, StronglyPreferNonDonated) {
   // contributed normally. Finally, we verify that we can still get the
   // donated huge pages back. (I.e. they weren't used.)
   std::vector<PAlloc> donated;
+  SpanAllocInfo info = {1, AccessDensityPrediction::kSparse};
   ASSERT_GE(kPagesPerHugePage, Length(10));
   for (auto i = Length(1); i <= Length(3); ++i) {
-    donated.push_back(Allocate(kPagesPerHugePage - i, /*donated=*/true));
+    donated.push_back(AllocateWithSpanAllocInfo(kPagesPerHugePage - i, info,
+                                                /*donated=*/true));
   }
 
   std::vector<PAlloc> regular;
-  for (auto i = Length(4); i >= Length(1); --i) {
+  // Only sparsely-accessed spans are allocated from donated hugepages.  So
+  // create a hugepage with a sparsely-accessed span.  The test should prefer
+  // this hugepage for sparsely-accessed spans and should allocate a new
+  // hugepage for densely-accessed spans.
+  regular.push_back(AllocateWithSpanAllocInfo(Length(4), info));
+
+  for (auto i = Length(3); i >= Length(1); --i) {
     regular.push_back(Allocate(i));
   }
 
@@ -1236,178 +1594,165 @@ TEST_P(FillerTest, StronglyPreferNonDonated) {
   }
 }
 
-TEST_P(FillerTest, ParallelUnlockingSubrelease) {
-  if (GetParam() == FillerPartialRerelease::Retain) {
-    // When rerelease happens without going to Unback(), this test
-    // (intentionally) deadlocks, as we never receive the call.
-    return;
-  }
-
-  // Verify that we can deallocate a partial huge page and successfully unlock
-  // the pageheap_lock without introducing race conditions around the metadata
-  // for PageTracker::released_.
-  //
-  // Currently, HPAA unbacks *all* subsequent deallocations to a huge page once
-  // we have broken up *any* part of it.
-  //
-  // If multiple deallocations are in-flight, we need to leave sufficient
-  // breadcrumbs to ourselves (PageTracker::releasing_ is a Length, not a bool)
-  // so that one deallocation completing does not have us "forget" that another
-  // deallocation is about to unback other parts of the hugepage.
-  //
-  // If PageTracker::releasing_ were a bool, the completion of "t1" and
-  // subsequent reallocation of "a2" in this test would mark the entirety of the
-  // page as full, so we would choose to *not* unback a2 (when deallocated) or
-  // a3 (when deallocated by t3).
-  constexpr Length N = kPagesPerHugePage;
-
-  auto a1 = AllocateRaw(N / 2);
-  auto a2 = AllocateRaw(Length(1));
-  auto a3 = AllocateRaw(Length(1));
-
-  // Trigger subrelease.  The filler now has a partial hugepage, so subsequent
-  // calls to Delete() will cause us to unback the remainder of it.
-  EXPECT_GT(ReleasePages(kMaxValidPages), Length(0));
-
-  auto m1 = absl::make_unique<absl::Mutex>();
-  auto m2 = absl::make_unique<absl::Mutex>();
-
-  m1->Lock();
-  m2->Lock();
-
-  absl::BlockingCounter counter(2);
-  BlockingUnback::counter = &counter;
-
-  std::thread t1([&]() {
-    BlockingUnback::set_lock(m1.get());
-
-    DeleteRaw(a2);
-  });
-
-  std::thread t2([&]() {
-    BlockingUnback::set_lock(m2.get());
-
-    DeleteRaw(a3);
-  });
-
-  // Wait for t1 and t2 to block.
-  counter.Wait();
-
-  // At this point, t1 and t2 are blocked (as if they were on a long-running
-  // syscall) on "unback" (m1 and m2, respectively).  pageheap_lock is not held.
-  //
-  // Allocating a4 will complete the hugepage, but we have on-going releaser
-  // threads.
-  auto a4 = AllocateRaw((N / 2) - Length(2));
-  EXPECT_EQ(NHugePages(1), filler_.size());
-
-  // Let one of the threads proceed.  The huge page consists of:
-  // * a1 (N/2  ):  Allocated
-  // * a2 (    1):  Unbacked
-  // * a3 (    1):  Unbacking (blocked on m2)
-  // * a4 (N/2-2):  Allocated
-  m1->Unlock();
-  t1.join();
-
-  // Reallocate a2.  We should still consider the huge page partially backed for
-  // purposes of subreleasing.
-  a2 = AllocateRaw(Length(1));
-  EXPECT_EQ(NHugePages(1), filler_.size());
-  DeleteRaw(a2);
-
-  // Let the other thread proceed.  The huge page consists of:
-  // * a1 (N/2  ):  Allocated
-  // * a2 (    1):  Unbacked
-  // * a3 (    1):  Unbacked
-  // * a4 (N/2-2):  Allocated
-  m2->Unlock();
-  t2.join();
-
-  EXPECT_EQ(filler_.used_pages(), N - Length(2));
-  EXPECT_EQ(filler_.unmapped_pages(), Length(2));
-  EXPECT_EQ(filler_.free_pages(), Length(0));
-
-  // Clean up.
-  DeleteRaw(a1);
-  DeleteRaw(a4);
-
-  BlockingUnback::counter = nullptr;
-}
-
-TEST_P(FillerTest, SkipSubrelease) {
+TEST_P(FillerTest, SkipPartialAllocSubrelease) {
   // This test is sensitive to the number of pages per hugepage, as we are
   // printing raw stats.
   if (kPagesPerHugePage != Length(256)) {
     GTEST_SKIP();
   }
 
-  // Generate a peak, wait for time interval a, generate a trough, subrelease,
-  // wait for time interval b, generate another peak.
-  const auto peak_trough_peak = [&](absl::Duration a, absl::Duration b,
-                                    absl::Duration peak_interval,
-                                    bool expected_subrelease) {
-    const Length N = kPagesPerHugePage;
-    PAlloc half = Allocate(N / 2);
-    PAlloc tiny1 = Allocate(N / 4);
-    PAlloc tiny2 = Allocate(N / 4);
+  // Firstly, this test generates a peak (long-term demand peak) and waits for
+  // time interval a. Then, it generates a higher peak plus a short-term
+  // fluctuation peak, and waits for time interval b. It then generates a trough
+  // in demand and tries to subrelease. Finally, it waits for time interval c to
+  // generate the highest peak for evaluating subrelease correctness. Skip
+  // subrelease selects those demand points using provided time intervals.
+  const auto demand_pattern =
+      [&](absl::Duration a, absl::Duration b, absl::Duration c,
+          SkipSubreleaseIntervals intervals, bool expected_subrelease) {
+        const Length N = kPagesPerHugePage;
+        // First peak: min_demand 3/4N, max_demand 1N.
+        PAlloc peak1a = Allocate(3 * N / 4);
+        PAlloc peak1b =
+            AllocateWithSpanAllocInfo(N / 4, peak1a.span_alloc_info);
+        Advance(a);
+        // Second peak: min_demand 0, max_demand 2N.
+        Delete(peak1a);
+        Delete(peak1b);
 
-    // To force a peak, we allocate 3/4 and 1/4 of a huge page.  This is
-    // necessary after we delete `half` below, as a half huge page for the peak
-    // would fill into the gap previously occupied by it.
-    PAlloc peak1a = Allocate(3 * N / 4);
-    PAlloc peak1b = Allocate(N / 4);
-    EXPECT_EQ(filler_.used_pages(), 2 * N);
-    Delete(peak1a);
-    Delete(peak1b);
-    Advance(a);
+        PAlloc half = Allocate(N / 2);
+        PAlloc tiny1 = AllocateWithSpanAllocInfo(N / 4, half.span_alloc_info);
+        PAlloc tiny2 = AllocateWithSpanAllocInfo(N / 4, half.span_alloc_info);
 
-    Delete(half);
+        // To force a peak, we allocate 3/4 and 1/4 of a huge page.  This is
+        // necessary after we delete `half` below, as a half huge page for the
+        // peak would fill into the gap previously occupied by it.
+        PAlloc peak2a = Allocate(3 * N / 4);
+        PAlloc peak2b =
+            AllocateWithSpanAllocInfo(N / 4, peak2a.span_alloc_info);
+        EXPECT_EQ(filler_.used_pages(), 2 * N);
+        Delete(peak2a);
+        Delete(peak2b);
+        Advance(b);
+        Delete(half);
+        EXPECT_EQ(filler_.free_pages(), Length(N / 2));
+        // The number of released pages is limited to the number of free pages.
+        EXPECT_EQ(expected_subrelease ? N / 2 : Length(0),
+                  ReleasePartialPages(10 * N, intervals));
 
-    EXPECT_EQ(expected_subrelease ? N / 2 : Length(0),
-              ReleasePages(10 * N, peak_interval));
+        Advance(c);
+        // Third peak: min_demand 1/2N, max_demand (2+1/2)N.
+        PAlloc peak3a = Allocate(3 * N / 4);
+        PAlloc peak3b =
+            AllocateWithSpanAllocInfo(N / 4, peak3a.span_alloc_info);
 
-    Advance(b);
+        PAlloc peak4a = Allocate(3 * N / 4);
+        PAlloc peak4b =
+            AllocateWithSpanAllocInfo(N / 4, peak4a.span_alloc_info);
 
-    PAlloc peak2a = Allocate(3 * N / 4);
-    PAlloc peak2b = Allocate(N / 4);
+        Delete(tiny1);
+        Delete(tiny2);
+        Delete(peak3a);
+        Delete(peak3b);
+        Delete(peak4a);
+        Delete(peak4b);
 
-    PAlloc peak3a = Allocate(3 * N / 4);
-    PAlloc peak3b = Allocate(N / 4);
+        EXPECT_EQ(filler_.used_pages(), Length(0));
+        EXPECT_EQ(filler_.unmapped_pages(), Length(0));
+        EXPECT_EQ(filler_.free_pages(), Length(0));
 
-    Delete(tiny1);
-    Delete(tiny2);
-    Delete(peak2a);
-    Delete(peak2b);
-    Delete(peak3a);
-    Delete(peak3b);
-
-    EXPECT_EQ(filler_.used_pages(), Length(0));
-    EXPECT_EQ(filler_.unmapped_pages(), Length(0));
-    EXPECT_EQ(filler_.free_pages(), Length(0));
-
-    EXPECT_EQ(expected_subrelease ? N / 2 : Length(0), ReleasePages(10 * N));
-  };
+        EXPECT_EQ(expected_subrelease ? N / 2 : Length(0),
+                  ReleasePartialPages(10 * N));
+      };
 
   {
-    SCOPED_TRACE("peak-trough-peak 1");
-    peak_trough_peak(absl::Minutes(2), absl::Minutes(2), absl::Minutes(3),
-                     false);
+    // Uses peak interval for skipping subrelease. We should correctly skip
+    // 128 pages.
+    SCOPED_TRACE("demand_pattern 1");
+    demand_pattern(absl::Minutes(2), absl::Minutes(1), absl::Minutes(3),
+                   SkipSubreleaseIntervals{.peak_interval = absl::Minutes(3)},
+                   false);
   }
 
   Advance(absl::Minutes(30));
 
   {
-    SCOPED_TRACE("peak-trough-peak 2");
-    peak_trough_peak(absl::Minutes(2), absl::Minutes(7), absl::Minutes(3),
-                     false);
+    // Repeats the "demand_pattern 1" test with additional short-term and
+    // long-term intervals, to show that skip-subrelease prioritizes using
+    // peak_interval.
+    SCOPED_TRACE("demand_pattern 2");
+    demand_pattern(
+        absl::Minutes(2), absl::Minutes(1), absl::Minutes(3),
+        SkipSubreleaseIntervals{.peak_interval = absl::Minutes(3),
+                                .short_interval = absl::Milliseconds(10),
+                                .long_interval = absl::Milliseconds(20)},
+        false);
   }
 
   Advance(absl::Minutes(30));
 
   {
-    SCOPED_TRACE("peak-trough-peak 3");
-    peak_trough_peak(absl::Minutes(5), absl::Minutes(3), absl::Minutes(2),
-                     true);
+    // Uses peak interval for skipping subrelease, subreleasing all free pages.
+    // The short-term interval is not used, as we prioritize using demand peak.
+    SCOPED_TRACE("demand_pattern 3");
+    demand_pattern(absl::Minutes(6), absl::Minutes(3), absl::Minutes(3),
+                   SkipSubreleaseIntervals{.peak_interval = absl::Minutes(2),
+                                           .short_interval = absl::Minutes(5)},
+                   true);
+  }
+
+  Advance(absl::Minutes(30));
+
+  {
+    // Skip subrelease feature is disabled if all intervals are zero.
+    SCOPED_TRACE("demand_pattern 4");
+    demand_pattern(absl::Minutes(1), absl::Minutes(1), absl::Minutes(4),
+                   SkipSubreleaseIntervals{}, true);
+  }
+
+  Advance(absl::Minutes(30));
+
+  {
+    // Uses short-term and long-term intervals for skipping subrelease. It
+    // incorrectly skips 128 pages.
+    SCOPED_TRACE("demand_pattern 5");
+    demand_pattern(absl::Minutes(3), absl::Minutes(2), absl::Minutes(7),
+                   SkipSubreleaseIntervals{.short_interval = absl::Minutes(3),
+                                           .long_interval = absl::Minutes(6)},
+                   false);
+  }
+
+  Advance(absl::Minutes(30));
+
+  {
+    // Uses short-term and long-term intervals for skipping subrelease,
+    // subreleasing all free pages.
+    SCOPED_TRACE("demand_pattern 6");
+    demand_pattern(absl::Minutes(4), absl::Minutes(2), absl::Minutes(3),
+                   SkipSubreleaseIntervals{.short_interval = absl::Minutes(1),
+                                           .long_interval = absl::Minutes(2)},
+                   true);
+  }
+  Advance(absl::Minutes(30));
+
+  {
+    // Uses only short-term interval for skipping subrelease. It correctly
+    // skips 128 pages.
+    SCOPED_TRACE("demand_pattern 7");
+    demand_pattern(absl::Minutes(4), absl::Minutes(2), absl::Minutes(3),
+                   SkipSubreleaseIntervals{.short_interval = absl::Minutes(3)},
+                   false);
+  }
+
+  Advance(absl::Minutes(30));
+
+  {
+    // Uses only long-term interval for skipping subrelease, subreleased all
+    // free pages.
+    SCOPED_TRACE("demand_pattern 8");
+    demand_pattern(absl::Minutes(4), absl::Minutes(2), absl::Minutes(3),
+                   SkipSubreleaseIntervals{.long_interval = absl::Minutes(2)},
+                   true);
   }
 
   Advance(absl::Minutes(30));
@@ -1416,9 +1761,20 @@ TEST_P(FillerTest, SkipSubrelease) {
   // subrelease decision (in the same time series epoch), do not count this as
   // a correct subrelease decision.
   {
-    SCOPED_TRACE("peak-trough-peak 4");
-    peak_trough_peak(absl::Milliseconds(10), absl::Milliseconds(10),
-                     absl::Minutes(2), false);
+    SCOPED_TRACE("demand_pattern 9");
+    demand_pattern(
+        absl::Milliseconds(10), absl::Milliseconds(10), absl::Milliseconds(10),
+        SkipSubreleaseIntervals{.peak_interval = absl::Minutes(2)}, false);
+  }
+  // Repeats the "demand_pattern 9" test using short-term and long-term
+  // intervals, to show that subrelease decisions are evaluated independently.
+  {
+    SCOPED_TRACE("demand_pattern 10");
+    demand_pattern(absl::Milliseconds(10), absl::Milliseconds(10),
+                   absl::Milliseconds(10),
+                   SkipSubreleaseIntervals{.short_interval = absl::Minutes(1),
+                                           .long_interval = absl::Minutes(2)},
+                   false);
   }
 
   Advance(absl::Minutes(30));
@@ -1435,8 +1791,337 @@ TEST_P(FillerTest, SkipSubrelease) {
   buffer.resize(strlen(buffer.c_str()));
 
   EXPECT_THAT(buffer, testing::HasSubstr(R"(
-HugePageFiller: Since the start of the execution, 4 subreleases (512 pages) were skipped due to recent (120s) peaks.
-HugePageFiller: 25.0000% of decisions confirmed correct, 0 pending (25.0000% of pages, 0 pending).
+HugePageFiller: Since the start of the execution, 6 subreleases (768 pages) were skipped due to either recent (120s) peaks, or the sum of short-term (60s) fluctuations and long-term (120s) trends.
+HugePageFiller: 50.0000% of decisions confirmed correct, 0 pending (50.0000% of pages, 0 pending), as per anticipated 300s realized fragmentation.
+)"));
+}
+
+TEST_P(FillerTest, SkipSubrelease) {
+  // This test is sensitive to the number of pages per hugepage, as we are
+  // printing raw stats.
+  if (kPagesPerHugePage != Length(256)) {
+    GTEST_SKIP();
+  }
+
+  // Firstly, this test generates a peak (long-term demand peak) and waits for
+  // time interval a. Then, it generates a higher peak plus a short-term
+  // fluctuation peak, and waits for time interval b. It then generates a trough
+  // in demand and tries to subrelease. Finally, it waits for time interval c to
+  // generate the highest peak for evaluating subrelease correctness. Skip
+  // subrelease selects those demand points using provided time intervals.
+  const auto demand_pattern = [&](absl::Duration a, absl::Duration b,
+                                  absl::Duration c,
+                                  SkipSubreleaseIntervals intervals,
+                                  bool expected_subrelease) {
+    const Length N = kPagesPerHugePage;
+    // First peak: min_demand 3/4N, max_demand 1N.
+    PAlloc peak1a = Allocate(3 * N / 4);
+    PAlloc peak1b = AllocateWithSpanAllocInfo(N / 4, peak1a.span_alloc_info);
+    Advance(a);
+    // Second peak: min_demand 0, max_demand 2N.
+    Delete(peak1a);
+    Delete(peak1b);
+
+    PAlloc half = Allocate(N / 2);
+    PAlloc tiny1 = AllocateWithSpanAllocInfo(N / 4, half.span_alloc_info);
+    PAlloc tiny2 = AllocateWithSpanAllocInfo(N / 4, half.span_alloc_info);
+
+    // To force a peak, we allocate 3/4 and 1/4 of a huge page.  This is
+    // necessary after we delete `half` below, as a half huge page for the
+    // peak would fill into the gap previously occupied by it.
+    PAlloc peak2a = Allocate(3 * N / 4);
+    PAlloc peak2b = AllocateWithSpanAllocInfo(N / 4, peak2a.span_alloc_info);
+    EXPECT_EQ(filler_.used_pages(), 2 * N);
+    Delete(peak2a);
+    Delete(peak2b);
+    Advance(b);
+    Delete(half);
+    EXPECT_EQ(filler_.free_pages(), Length(N / 2));
+    // The number of released pages is limited to the number of free pages.
+    EXPECT_EQ(expected_subrelease ? N / 2 : Length(0),
+              ReleasePages(10 * N, intervals));
+
+    Advance(c);
+    // Third peak: min_demand 1/2N, max_demand (2+1/2)N.
+    PAlloc peak3a = Allocate(3 * N / 4);
+    PAlloc peak3b = AllocateWithSpanAllocInfo(N / 4, peak3a.span_alloc_info);
+
+    PAlloc peak4a = Allocate(3 * N / 4);
+    PAlloc peak4b = AllocateWithSpanAllocInfo(N / 4, peak4a.span_alloc_info);
+
+    Delete(tiny1);
+    Delete(tiny2);
+    Delete(peak3a);
+    Delete(peak3b);
+    Delete(peak4a);
+    Delete(peak4b);
+
+    EXPECT_EQ(filler_.used_pages(), Length(0));
+    EXPECT_EQ(filler_.unmapped_pages(), Length(0));
+    EXPECT_EQ(filler_.free_pages(), Length(0));
+
+    EXPECT_EQ(expected_subrelease ? N / 2 : Length(0), ReleasePages(10 * N));
+  };
+
+  {
+    // Uses peak interval for skipping subrelease. We should correctly skip
+    // 128 pages.
+    SCOPED_TRACE("demand_pattern 1");
+    demand_pattern(absl::Minutes(2), absl::Minutes(1), absl::Minutes(3),
+                   SkipSubreleaseIntervals{.peak_interval = absl::Minutes(3)},
+                   false);
+  }
+
+  Advance(absl::Minutes(30));
+
+  {
+    // Repeats the "demand_pattern 1" test with additional short-term and
+    // long-term intervals, to show that skip-subrelease prioritizes using
+    // peak_interval.
+    SCOPED_TRACE("demand_pattern 2");
+    demand_pattern(
+        absl::Minutes(2), absl::Minutes(1), absl::Minutes(3),
+        SkipSubreleaseIntervals{.peak_interval = absl::Minutes(3),
+                                .short_interval = absl::Milliseconds(10),
+                                .long_interval = absl::Milliseconds(20)},
+        false);
+  }
+
+  Advance(absl::Minutes(30));
+
+  {
+    // Uses peak interval for skipping subrelease, subreleasing all free pages.
+    // The short-term interval is not used, as we prioritize using demand peak.
+    SCOPED_TRACE("demand_pattern 3");
+    demand_pattern(absl::Minutes(6), absl::Minutes(3), absl::Minutes(3),
+                   SkipSubreleaseIntervals{.peak_interval = absl::Minutes(2),
+                                           .short_interval = absl::Minutes(5)},
+                   true);
+  }
+
+  Advance(absl::Minutes(30));
+
+  {
+    // Skip subrelease feature is disabled if all intervals are zero.
+    SCOPED_TRACE("demand_pattern 4");
+    demand_pattern(absl::Minutes(1), absl::Minutes(1), absl::Minutes(4),
+                   SkipSubreleaseIntervals{}, true);
+  }
+
+  Advance(absl::Minutes(30));
+
+  {
+    // Uses short-term and long-term intervals for skipping subrelease. It
+    // incorrectly skips 128 pages.
+    SCOPED_TRACE("demand_pattern 5");
+    demand_pattern(absl::Minutes(3), absl::Minutes(2), absl::Minutes(7),
+                   SkipSubreleaseIntervals{.short_interval = absl::Minutes(3),
+                                           .long_interval = absl::Minutes(6)},
+                   false);
+  }
+
+  Advance(absl::Minutes(30));
+
+  {
+    // Uses short-term and long-term intervals for skipping subrelease,
+    // subreleasing all free pages.
+    SCOPED_TRACE("demand_pattern 6");
+    demand_pattern(absl::Minutes(4), absl::Minutes(2), absl::Minutes(3),
+                   SkipSubreleaseIntervals{.short_interval = absl::Minutes(1),
+                                           .long_interval = absl::Minutes(2)},
+                   true);
+  }
+  Advance(absl::Minutes(30));
+
+  {
+    // Uses only short-term interval for skipping subrelease. It correctly
+    // skips 128 pages.
+    SCOPED_TRACE("demand_pattern 7");
+    demand_pattern(absl::Minutes(4), absl::Minutes(2), absl::Minutes(3),
+                   SkipSubreleaseIntervals{.short_interval = absl::Minutes(3)},
+                   false);
+  }
+
+  Advance(absl::Minutes(30));
+
+  {
+    // Uses only long-term interval for skipping subrelease, subreleased all
+    // free pages.
+    SCOPED_TRACE("demand_pattern 8");
+    demand_pattern(absl::Minutes(4), absl::Minutes(2), absl::Minutes(3),
+                   SkipSubreleaseIntervals{.long_interval = absl::Minutes(2)},
+                   true);
+  }
+
+  Advance(absl::Minutes(30));
+
+  // This captures a corner case: If we hit another peak immediately after a
+  // subrelease decision (in the same time series epoch), do not count this as
+  // a correct subrelease decision.
+  {
+    SCOPED_TRACE("demand_pattern 9");
+    demand_pattern(
+        absl::Milliseconds(10), absl::Milliseconds(10), absl::Milliseconds(10),
+        SkipSubreleaseIntervals{.peak_interval = absl::Minutes(2)}, false);
+  }
+  // Repeats the "demand_pattern 9" test using short-term and long-term
+  // intervals, to show that subrelease decisions are evaluated independently.
+  {
+    SCOPED_TRACE("demand_pattern 10");
+    demand_pattern(absl::Milliseconds(10), absl::Milliseconds(10),
+                   absl::Milliseconds(10),
+                   SkipSubreleaseIntervals{.short_interval = absl::Minutes(1),
+                                           .long_interval = absl::Minutes(2)},
+                   false);
+  }
+
+  Advance(absl::Minutes(30));
+
+  // Ensure that the tracker is updated.
+  auto tiny = Allocate(Length(1));
+  Delete(tiny);
+
+  std::string buffer(1024 * 1024, '\0');
+  {
+    Printer printer(&*buffer.begin(), buffer.size());
+    filler_.Print(&printer, true);
+  }
+  buffer.resize(strlen(buffer.c_str()));
+
+  EXPECT_THAT(buffer, testing::HasSubstr(R"(
+HugePageFiller: Since the start of the execution, 6 subreleases (768 pages) were skipped due to either recent (120s) peaks, or the sum of short-term (60s) fluctuations and long-term (120s) trends.
+HugePageFiller: 50.0000% of decisions confirmed correct, 0 pending (50.0000% of pages, 0 pending), as per anticipated 300s realized fragmentation.
+)"));
+}
+
+TEST_P(FillerTest, SkipSubReleaseDemandPeak) {
+  // Tests that HugePageFiller can cap filler's short-term long-term
+  // skip-subrelease mechanism using the demand measured by subrelease
+  // intervals.
+
+  const Length N = kPagesPerHugePage;
+
+  // We trigger the demand such that short-term + long-term demand exceeds the
+  // peak demand. We should be able to sub-release memory from the HugeFiller
+  // up to the peak demand measured in the previous intervals.
+
+  // min_demand = 0.75N, max_demand = 2.5N
+  PAlloc peak1a = Allocate(3 * N / 4);
+  PAlloc peak1b = AllocateWithSpanAllocInfo(3 * N / 4, peak1a.span_alloc_info);
+  PAlloc half1a = AllocateWithSpanAllocInfo(N / 2, peak1a.span_alloc_info);
+  PAlloc half1b = AllocateWithSpanAllocInfo(N / 2, peak1a.span_alloc_info);
+  EXPECT_EQ(filler_.used_pages(), 2 * N + N / 2);
+  Advance(absl::Minutes(1));
+
+  // min_demand = 2N, max_demand = 2.5N
+  Delete(half1b);
+  PAlloc half1c = AllocateWithSpanAllocInfo(N / 2, peak1a.span_alloc_info);
+  EXPECT_EQ(filler_.used_pages(), 2 * N + N / 2);
+  EXPECT_EQ(filler_.free_pages(), N / 2);
+  Advance(absl::Minutes(1));
+
+  // At this point, short-term fluctuation, which is the maximum of the
+  // difference between max_demand and min_demand in the previous two
+  // intervals, is equal to 1.75N. Long-term demand, which is the maximum of
+  // min_demand in the previous two intervals, is 2N. As peak demand of 2.5N is
+  // lower than 3.75N, we should be able to subrelease 0.5N pages.
+  EXPECT_EQ(Length(N / 2),
+            ReleasePages(10 * N, SkipSubreleaseIntervals{
+                                     .short_interval = absl::Minutes(2),
+                                     .long_interval = absl::Minutes(2)}));
+  Delete(peak1a);
+  Delete(peak1b);
+  Delete(half1a);
+  Delete(half1c);
+}
+
+TEST_P(FillerTest, ReportSkipSubreleases) {
+  // Tests that HugePageFiller reports skipped subreleases using demand
+  // requirement that is the smaller of two (recent peak and its
+  // current capacity). This fix makes evaluating skip subrelease more accurate,
+  // which is useful for cross-comparing performance of different
+  // skip-subrelease intervals.
+
+  // This test is sensitive to the number of pages per hugepage, as we are
+  // printing raw stats.
+  if (kPagesPerHugePage != Length(256)) {
+    GTEST_SKIP();
+  }
+  const Length N = kPagesPerHugePage;
+  // Reports skip subrelease using the recent demand peak (2.5N): it is smaller
+  // than the total number of pages (3N) when 0.25N free pages are skipped. The
+  // skipping is correct as the future demand is 2.5N.
+  PAlloc peak1a = Allocate(3 * N / 4);
+  PAlloc peak1b = AllocateWithSpanAllocInfo(N / 4, peak1a.span_alloc_info);
+  PAlloc peak2a = AllocateWithSpanAllocInfo(3 * N / 4, peak1a.span_alloc_info);
+  PAlloc peak2b = AllocateWithSpanAllocInfo(N / 4, peak1a.span_alloc_info);
+  PAlloc half1 = AllocateWithSpanAllocInfo(N / 2, peak1a.span_alloc_info);
+  Advance(absl::Minutes(2));
+  Delete(half1);
+  Delete(peak1b);
+  Delete(peak2b);
+  PAlloc peak3a = AllocateWithSpanAllocInfo(3 * N / 4, peak1a.span_alloc_info);
+  EXPECT_EQ(filler_.free_pages(), 3 * N / 4);
+  // Subreleases 0.5N free pages and skips 0.25N free pages.
+  EXPECT_EQ(N / 2,
+            ReleasePages(10 * N, SkipSubreleaseIntervals{
+                                     .peak_interval = absl::Minutes(3)}));
+  Advance(absl::Minutes(3));
+  PAlloc tiny1 = AllocateWithSpanAllocInfo(N / 4, peak1a.span_alloc_info);
+  EXPECT_EQ(filler_.used_pages(), 2 * N + N / 2);
+  EXPECT_EQ(filler_.unmapped_pages(), N / 2);
+  EXPECT_EQ(filler_.free_pages(), Length(0));
+  Delete(peak1a);
+  Delete(peak2a);
+  Delete(peak3a);
+  Delete(tiny1);
+  EXPECT_EQ(filler_.used_pages(), Length(0));
+  EXPECT_EQ(filler_.unmapped_pages(), Length(0));
+  EXPECT_EQ(filler_.free_pages(), Length(0));
+  // Accounts for pages that are eagerly unmapped (unmapping_unaccounted_).
+  EXPECT_EQ(N + N / 2, ReleasePages(10 * N));
+
+  Advance(absl::Minutes(30));
+
+  // Reports skip subrelease using HugePageFiller's capacity (N pages): it is
+  // smaller than the recent peak (2N) when 0.5N pages are skipped. They are
+  // correctly skipped as the future demand is N.
+  PAlloc peak4a = Allocate(3 * N / 4);
+  PAlloc peak4b = AllocateWithSpanAllocInfo(N / 4, peak4a.span_alloc_info);
+  PAlloc peak5a = Allocate(3 * N / 4);
+  PAlloc peak5b = AllocateWithSpanAllocInfo(N / 4, peak5a.span_alloc_info);
+  Advance(absl::Minutes(2));
+  Delete(peak4a);
+  Delete(peak4b);
+  Delete(peak5a);
+  Delete(peak5b);
+  PAlloc half2 = Allocate(N / 2);
+  EXPECT_EQ(Length(0),
+            ReleasePages(10 * N, SkipSubreleaseIntervals{
+                                     .peak_interval = absl::Minutes(3)}));
+  Advance(absl::Minutes(3));
+  PAlloc half3 = Allocate(N / 2);
+  Delete(half2);
+  Delete(half3);
+  EXPECT_EQ(filler_.used_pages(), Length(0));
+  EXPECT_EQ(filler_.unmapped_pages(), Length(0));
+  EXPECT_EQ(filler_.free_pages(), Length(0));
+  EXPECT_EQ(Length(0), ReleasePages(10 * N));
+  Advance(absl::Minutes(30));
+  //  Ensures that the tracker is updated.
+  auto tiny2 = Allocate(Length(1));
+  Delete(tiny2);
+
+  std::string buffer(1024 * 1024, '\0');
+  {
+    Printer printer(&*buffer.begin(), buffer.size());
+    filler_.Print(&printer, true);
+  }
+  buffer.resize(strlen(buffer.c_str()));
+
+  EXPECT_THAT(buffer, testing::HasSubstr(R"(
+HugePageFiller: Since the start of the execution, 2 subreleases (192 pages) were skipped due to either recent (180s) peaks, or the sum of short-term (0s) fluctuations and long-term (0s) trends.
+HugePageFiller: 100.0000% of decisions confirmed correct, 0 pending (100.0000% of pages, 0 pending), as per anticipated 300s realized fragmentation.
 )"));
 }
 
@@ -1469,6 +2154,12 @@ class FillerStatsTrackerTest : public testing::Test {
   // Generates a data point with a particular amount of demand pages, while
   // ignoring the specific number of hugepages.
   void GenerateDemandPoint(Length num_pages, Length num_free_pages);
+
+  void SetUp() override {
+    // Resets the clock used by FillerStatsTracker, allowing each test starts
+    // in epoch 0.
+    clock_ = 0;
+  }
 };
 
 int64_t FillerStatsTrackerTest::clock_{0};
@@ -1543,159 +2234,9 @@ HugePageFiller: at peak demand: 26 hps (14 regular, 10 donated, 1 partial, 1 rel
 HugePageFiller: at peak hps: 208 pages (and 111 free, 10 unmapped)
 HugePageFiller: at peak hps: 26 hps (14 regular, 10 donated, 1 partial, 1 released)
 
-HugePageFiller: Since the start of the execution, 0 subreleases (0 pages) were skipped due to recent (0s) peaks.
-HugePageFiller: 0.0000% of decisions confirmed correct, 0 pending (0.0000% of pages, 0 pending).
-HugePageFiller: Subrelease stats last 10 min: total 0 pages subreleased, 0 hugepages broken
-)"));
-  }
-
-  // Test pbtxt output (full time series).
-  {
-    std::string buffer(1024 * 1024, '\0');
-    Printer printer(&*buffer.begin(), buffer.size());
-    {
-      PbtxtRegion region(&printer, kTop, /*indent=*/0);
-      tracker_.PrintInPbtxt(&region);
-    }
-    buffer.erase(printer.SpaceRequired());
-
-    EXPECT_THAT(buffer, StrEq(R"(
-  filler_skipped_subrelease {
-    skipped_subrelease_interval_ms: 0
-    skipped_subrelease_pages: 0
-    correctly_skipped_subrelease_pages: 0
-    pending_skipped_subrelease_pages: 0
-    skipped_subrelease_count: 0
-    correctly_skipped_subrelease_count: 0
-    pending_skipped_subrelease_count: 0
-  }
-  filler_stats_timeseries {
-    window_ms: 37500
-    epochs: 16
-    min_free_pages_interval_ms: 300000
-    min_free_pages: 110
-    min_free_backed_pages: 100
-    measurements {
-      epoch: 6
-      timestamp_ms: 0
-      min_free_pages: 11
-      min_free_backed_pages: 1
-      num_pages_subreleased: 0
-      num_hugepages_broken: 0
-      at_minimum_demand {
-        num_pages: 1
-        regular_huge_pages: 5
-        donated_huge_pages: 1
-        partial_released_huge_pages: 1
-        released_huge_pages: 0
-        used_pages_in_subreleased_huge_pages: 1
-      }
-      at_maximum_demand {
-        num_pages: 9
-        regular_huge_pages: 5
-        donated_huge_pages: 1
-        partial_released_huge_pages: 1
-        released_huge_pages: 1
-        used_pages_in_subreleased_huge_pages: 1
-      }
-      at_minimum_huge_pages {
-        num_pages: 5
-        regular_huge_pages: 1
-        donated_huge_pages: 1
-        partial_released_huge_pages: 0
-        released_huge_pages: 0
-        used_pages_in_subreleased_huge_pages: 1
-      }
-      at_maximum_huge_pages {
-        num_pages: 5
-        regular_huge_pages: 9
-        donated_huge_pages: 1
-        partial_released_huge_pages: 0
-        released_huge_pages: 1
-        used_pages_in_subreleased_huge_pages: 1
-      }
-    }
-    measurements {
-      epoch: 14
-      timestamp_ms: 300000
-      min_free_pages: 210
-      min_free_backed_pages: 200
-      num_pages_subreleased: 0
-      num_hugepages_broken: 0
-      at_minimum_demand {
-        num_pages: 100
-        regular_huge_pages: 9
-        donated_huge_pages: 5
-        partial_released_huge_pages: 1
-        released_huge_pages: 0
-        used_pages_in_subreleased_huge_pages: 100
-      }
-      at_maximum_demand {
-        num_pages: 108
-        regular_huge_pages: 9
-        donated_huge_pages: 5
-        partial_released_huge_pages: 1
-        released_huge_pages: 1
-        used_pages_in_subreleased_huge_pages: 100
-      }
-      at_minimum_huge_pages {
-        num_pages: 104
-        regular_huge_pages: 5
-        donated_huge_pages: 5
-        partial_released_huge_pages: 0
-        released_huge_pages: 0
-        used_pages_in_subreleased_huge_pages: 100
-      }
-      at_maximum_huge_pages {
-        num_pages: 104
-        regular_huge_pages: 13
-        donated_huge_pages: 5
-        partial_released_huge_pages: 0
-        released_huge_pages: 1
-        used_pages_in_subreleased_huge_pages: 100
-      }
-    }
-    measurements {
-      epoch: 15
-      timestamp_ms: 337500
-      min_free_pages: 110
-      min_free_backed_pages: 100
-      num_pages_subreleased: 0
-      num_hugepages_broken: 0
-      at_minimum_demand {
-        num_pages: 200
-        regular_huge_pages: 14
-        donated_huge_pages: 10
-        partial_released_huge_pages: 1
-        released_huge_pages: 0
-        used_pages_in_subreleased_huge_pages: 200
-      }
-      at_maximum_demand {
-        num_pages: 208
-        regular_huge_pages: 14
-        donated_huge_pages: 10
-        partial_released_huge_pages: 1
-        released_huge_pages: 1
-        used_pages_in_subreleased_huge_pages: 200
-      }
-      at_minimum_huge_pages {
-        num_pages: 204
-        regular_huge_pages: 10
-        donated_huge_pages: 10
-        partial_released_huge_pages: 0
-        released_huge_pages: 0
-        used_pages_in_subreleased_huge_pages: 200
-      }
-      at_maximum_huge_pages {
-        num_pages: 204
-        regular_huge_pages: 18
-        donated_huge_pages: 10
-        partial_released_huge_pages: 0
-        released_huge_pages: 1
-        used_pages_in_subreleased_huge_pages: 200
-      }
-    }
-  }
+HugePageFiller: Since the start of the execution, 0 subreleases (0 pages) were skipped due to either recent (0s) peaks, or the sum of short-term (0s) fluctuations and long-term (0s) trends.
+HugePageFiller: 0.0000% of decisions confirmed correct, 0 pending (0.0000% of pages, 0 pending), as per anticipated 0s realized fragmentation.
+HugePageFiller: Subrelease stats last 10 min: total 0 pages subreleased (0 pages from partial allocs), 0 hugepages broken
 )"));
   }
 }
@@ -1715,34 +2256,68 @@ TEST_F(FillerStatsTrackerTest, ComputeRecentPeaks) {
   Advance(absl::Minutes(1));
   GenerateDemandPoint(Length(100), Length(2000));
   Advance(absl::Minutes(1));
-  GenerateDemandPoint(Length(200), Length(3000));
+  GenerateDemandPoint(Length(500), Length(3000));
 
-  GenerateDemandPoint(Length(200), Length(3000));
-  FillerStatsTracker<>::FillerStats stats =
-      tracker_.GetRecentPeak(absl::Minutes(3));
-  EXPECT_EQ(stats.num_pages, Length(1500));
-  EXPECT_EQ(stats.free_pages, Length(0));
-
-  FillerStatsTracker<>::FillerStats stats2 =
-      tracker_.GetRecentPeak(absl::Minutes(5));
-  EXPECT_EQ(stats2.num_pages, Length(3000));
-  EXPECT_EQ(stats2.free_pages, Length(1000));
+  Length peak = tracker_.GetRecentPeak(absl::Minutes(3));
+  EXPECT_EQ(peak, Length(1500));
+  Length peak2 = tracker_.GetRecentPeak(absl::Minutes(5));
+  EXPECT_EQ(peak2, Length(3000));
 
   Advance(absl::Minutes(4));
   GenerateDemandPoint(Length(200), Length(3000));
 
-  FillerStatsTracker<>::FillerStats stats3 =
-      tracker_.GetRecentPeak(absl::Minutes(4));
-  EXPECT_EQ(stats3.num_pages, Length(200));
-  EXPECT_EQ(stats3.free_pages, Length(3000));
+  Length peak3 = tracker_.GetRecentPeak(absl::Minutes(4));
+  EXPECT_EQ(peak3, Length(200));
 
   Advance(absl::Minutes(5));
+  GenerateDemandPoint(Length(150), Length(3000));
+
+  Length peak4 = tracker_.GetRecentPeak(absl::Minutes(5));
+  EXPECT_EQ(peak4, Length(150));
+}
+
+TEST_F(FillerStatsTrackerTest, ComputeRecentDemand) {
+  // Generates max and min demand in each epoch to create short-term demand
+  // fluctuations.
+  GenerateDemandPoint(Length(1500), Length(2000));
+  GenerateDemandPoint(Length(3000), Length(1000));
+  Advance(absl::Minutes(1.25));
+  GenerateDemandPoint(Length(500), Length(1000));
+  GenerateDemandPoint(Length(1500), Length(0));
+  Advance(absl::Minutes(1));
+  GenerateDemandPoint(Length(50), Length(1000));
+  GenerateDemandPoint(Length(100), Length(2000));
+  Advance(absl::Minutes(1));
+  GenerateDemandPoint(Length(100), Length(2000));
+  GenerateDemandPoint(Length(300), Length(3000));
+
+  Length short_long_peak_pages =
+      tracker_.GetRecentDemand(absl::Minutes(2), absl::Minutes(3));
+  EXPECT_EQ(short_long_peak_pages, Length(700));
+  Length short_long_peak_pages2 =
+      tracker_.GetRecentDemand(absl::Minutes(5), absl::Minutes(5));
+  EXPECT_EQ(short_long_peak_pages2, Length(3000));
+
+  Advance(absl::Minutes(4));
+  GenerateDemandPoint(Length(150), Length(500));
   GenerateDemandPoint(Length(200), Length(3000));
 
-  FillerStatsTracker<>::FillerStats stats4 =
-      tracker_.GetRecentPeak(absl::Minutes(5));
-  EXPECT_EQ(stats4.num_pages, Length(200));
-  EXPECT_EQ(stats4.free_pages, Length(3000));
+  Length short_long_peak_pages3 =
+      tracker_.GetRecentDemand(absl::Minutes(1), absl::ZeroDuration());
+  EXPECT_EQ(short_long_peak_pages3, Length(50));
+
+  Advance(absl::Minutes(5));
+  GenerateDemandPoint(Length(100), Length(700));
+  GenerateDemandPoint(Length(150), Length(800));
+
+  Length short_long_peak_pages4 =
+      tracker_.GetRecentDemand(absl::ZeroDuration(), absl::Minutes(5));
+  EXPECT_EQ(short_long_peak_pages4, Length(100));
+  // The short_interval needs to be shorter or equal to the long_interval when
+  // they are both set.
+  EXPECT_DEBUG_DEATH(
+      tracker_.GetRecentDemand(absl::Minutes(2), absl::Minutes(1)),
+      testing::HasSubstr("short_interval <= long_interval"));
 }
 
 TEST_F(FillerStatsTrackerTest, TrackCorrectSubreleaseDecisions) {
@@ -1752,8 +2327,7 @@ TEST_F(FillerStatsTrackerTest, TrackCorrectSubreleaseDecisions) {
   // Incorrect subrelease: Subrelease to 1000
   Advance(absl::Minutes(1));
   GenerateDemandPoint(Length(100), Length(1000));
-  tracker_.ReportSkippedSubreleasePages(Length(900), Length(1000),
-                                        absl::Minutes(3));
+  tracker_.ReportSkippedSubreleasePages(Length(900), Length(1000));
 
   // Second peak (small)
   Advance(absl::Minutes(1));
@@ -1769,11 +2343,9 @@ TEST_F(FillerStatsTrackerTest, TrackCorrectSubreleaseDecisions) {
   // Correct subrelease: Subrelease to 500
   Advance(absl::Minutes(1));
   GenerateDemandPoint(Length(500), Length(100));
-  tracker_.ReportSkippedSubreleasePages(Length(50), Length(550),
-                                        absl::Minutes(3));
+  tracker_.ReportSkippedSubreleasePages(Length(50), Length(550));
   GenerateDemandPoint(Length(500), Length(50));
-  tracker_.ReportSkippedSubreleasePages(Length(50), Length(500),
-                                        absl::Minutes(3));
+  tracker_.ReportSkippedSubreleasePages(Length(50), Length(500));
   GenerateDemandPoint(Length(500), Length(0));
 
   EXPECT_EQ(tracker_.total_skipped().pages, Length(1000));
@@ -1784,7 +2356,7 @@ TEST_F(FillerStatsTrackerTest, TrackCorrectSubreleaseDecisions) {
   EXPECT_EQ(tracker_.pending_skipped().count, 3);
 
   // Third peak (large, too late for first peak)
-  Advance(absl::Minutes(1));
+  Advance(absl::Minutes(4));
   GenerateDemandPoint(Length(1100), Length(1000));
 
   Advance(absl::Minutes(5));
@@ -1829,7 +2401,10 @@ TEST_F(FillerStatsTrackerTest, SubreleaseCorrectnessWithChangingIntervals) {
 }
 
 std::vector<FillerTest::PAlloc> FillerTest::GenerateInterestingAllocs() {
-  PAlloc a = Allocate(Length(1));
+  SpanAllocInfo info_sparsely_accessed = {1, AccessDensityPrediction::kSparse};
+  SpanAllocInfo info_densely_accessed = {kMaxValidPages.raw_num(),
+                                         AccessDensityPrediction::kDense};
+  PAlloc a = AllocateWithSpanAllocInfo(Length(1), info_sparsely_accessed);
   EXPECT_EQ(ReleasePages(kMaxValidPages), kPagesPerHugePage - Length(1));
   Delete(a);
   // Get the report on the released page
@@ -1841,1675 +2416,30 @@ std::vector<FillerTest::PAlloc> FillerTest::GenerateInterestingAllocs() {
   static_assert(kPagesPerHugePage > Length(7),
                 "Not enough pages per hugepage!");
   for (auto i = Length(0); i < Length(7); ++i) {
-    result.push_back(Allocate(kPagesPerHugePage - i - Length(1)));
+    result.push_back(AllocateWithSpanAllocInfo(
+        kPagesPerHugePage - i - Length(1), info_sparsely_accessed));
+    result.push_back(AllocateWithSpanAllocInfo(
+        kPagesPerHugePage - i - Length(1), info_densely_accessed));
   }
 
-  // Get two released hugepages.
+  // Get released hugepages.
   EXPECT_EQ(ReleasePages(Length(7)), Length(7));
+  EXPECT_EQ(ReleasePages(Length(7)), Length(7));
+  EXPECT_EQ(ReleasePages(Length(6)), Length(6));
   EXPECT_EQ(ReleasePages(Length(6)), Length(6));
 
   // Fill some of the remaining pages with small allocations.
   for (int i = 0; i < 9; ++i) {
-    result.push_back(Allocate(Length(1)));
+    result.push_back(
+        AllocateWithSpanAllocInfo(Length(1), info_sparsely_accessed));
+    result.push_back(
+        AllocateWithSpanAllocInfo(Length(1), info_densely_accessed));
   }
 
   // Finally, donate one hugepage.
-  result.push_back(Allocate(Length(1), /*donated=*/true));
+  result.push_back(AllocateWithSpanAllocInfo(Length(1), info_sparsely_accessed,
+                                             /*donated=*/true));
   return result;
-}
-
-// Test the output of Print(). This is something of a change-detector test,
-// but that's not all bad in this case.
-TEST_P(FillerTest, Print) {
-  if (kPagesPerHugePage != Length(256)) {
-    // The output is hardcoded on this assumption, and dynamically calculating
-    // it would be way too much of a pain.
-    return;
-  }
-  auto allocs = GenerateInterestingAllocs();
-
-  std::string buffer(1024 * 1024, '\0');
-  {
-    Printer printer(&*buffer.begin(), buffer.size());
-    filler_.Print(&printer, /*everything=*/true);
-    buffer.erase(printer.SpaceRequired());
-  }
-
-  EXPECT_THAT(
-      buffer,
-      StrEq(R"(HugePageFiller: densely pack small requests into hugepages
-HugePageFiller: 8 total, 3 full, 3 partial, 2 released (0 partially), 0 quarantined
-HugePageFiller: 261 pages free in 8 hugepages, 0.1274 free
-HugePageFiller: among non-fulls, 0.3398 free
-HugePageFiller: 499 used pages in subreleased hugepages (0 of them in partially released)
-HugePageFiller: 2 hugepages partially released, 0.0254 released
-HugePageFiller: 0.7187 of used pages hugepageable
-HugePageFiller: Since startup, 269 pages subreleased, 3 hugepages broken, (0 pages, 0 hugepages due to reaching tcmalloc limit)
-
-HugePageFiller: fullness histograms
-
-HugePageFiller: # of regular hps with a<= # of free pages <b
-HugePageFiller: <  0<=     3 <  1<=     1 <  2<=     0 <  3<=     0 <  4<=     1 < 16<=     0
-HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
-HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
-HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
-
-HugePageFiller: # of donated hps with a<= # of free pages <b
-HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     0 < 16<=     0
-HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
-HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
-HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     1
-
-HugePageFiller: # of partial released hps with a<= # of free pages <b
-HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     0 < 16<=     0
-HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
-HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
-HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
-
-HugePageFiller: # of released hps with a<= # of free pages <b
-HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     2 < 16<=     0
-HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
-HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
-HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
-
-HugePageFiller: # of regular hps with a<= longest free range <b
-HugePageFiller: <  0<=     3 <  1<=     1 <  2<=     0 <  3<=     0 <  4<=     1 < 16<=     0
-HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
-HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
-HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
-
-HugePageFiller: # of partial released hps with a<= longest free range <b
-HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     0 < 16<=     0
-HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
-HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
-HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
-
-HugePageFiller: # of released hps with a<= longest free range <b
-HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     2 < 16<=     0
-HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
-HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
-HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
-
-HugePageFiller: # of regular hps with a<= # of allocations <b
-HugePageFiller: <  1<=     1 <  2<=     1 <  3<=     1 <  4<=     2 <  5<=     0 < 17<=     0
-HugePageFiller: < 33<=     0 < 49<=     0 < 65<=     0 < 81<=     0 < 97<=     0 <113<=     0
-HugePageFiller: <129<=     0 <145<=     0 <161<=     0 <177<=     0 <193<=     0 <209<=     0
-HugePageFiller: <225<=     0 <241<=     0 <253<=     0 <254<=     0 <255<=     0 <256<=     0
-
-HugePageFiller: # of partial released hps with a<= # of allocations <b
-HugePageFiller: <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     0 <  5<=     0 < 17<=     0
-HugePageFiller: < 33<=     0 < 49<=     0 < 65<=     0 < 81<=     0 < 97<=     0 <113<=     0
-HugePageFiller: <129<=     0 <145<=     0 <161<=     0 <177<=     0 <193<=     0 <209<=     0
-HugePageFiller: <225<=     0 <241<=     0 <253<=     0 <254<=     0 <255<=     0 <256<=     0
-
-HugePageFiller: # of released hps with a<= # of allocations <b
-HugePageFiller: <  1<=     2 <  2<=     0 <  3<=     0 <  4<=     0 <  5<=     0 < 17<=     0
-HugePageFiller: < 33<=     0 < 49<=     0 < 65<=     0 < 81<=     0 < 97<=     0 <113<=     0
-HugePageFiller: <129<=     0 <145<=     0 <161<=     0 <177<=     0 <193<=     0 <209<=     0
-HugePageFiller: <225<=     0 <241<=     0 <253<=     0 <254<=     0 <255<=     0 <256<=     0
-
-HugePageFiller: time series over 5 min interval
-
-HugePageFiller: realized fragmentation: 0.0 MiB
-HugePageFiller: minimum free pages: 0 (0 backed)
-HugePageFiller: at peak demand: 1774 pages (and 261 free, 13 unmapped)
-HugePageFiller: at peak demand: 8 hps (5 regular, 1 donated, 0 partial, 2 released)
-HugePageFiller: at peak hps: 1774 pages (and 261 free, 13 unmapped)
-HugePageFiller: at peak hps: 8 hps (5 regular, 1 donated, 0 partial, 2 released)
-
-HugePageFiller: Since the start of the execution, 0 subreleases (0 pages) were skipped due to recent (0s) peaks.
-HugePageFiller: 0.0000% of decisions confirmed correct, 0 pending (0.0000% of pages, 0 pending).
-HugePageFiller: Subrelease stats last 10 min: total 269 pages subreleased, 3 hugepages broken
-)"));
-  for (const auto& alloc : allocs) {
-    Delete(alloc);
-  }
-}
-
-// Test the output of PrintInPbtxt(). This is something of a change-detector
-// test, but that's not all bad in this case.
-TEST_P(FillerTest, PrintInPbtxt) {
-  if (kPagesPerHugePage != Length(256)) {
-    // The output is hardcoded on this assumption, and dynamically calculating
-    // it would be way too much of a pain.
-    return;
-  }
-  auto allocs = GenerateInterestingAllocs();
-
-  std::string buffer(1024 * 1024, '\0');
-  Printer printer(&*buffer.begin(), buffer.size());
-  {
-    PbtxtRegion region(&printer, kTop, /*indent=*/0);
-    filler_.PrintInPbtxt(&region);
-  }
-  buffer.erase(printer.SpaceRequired());
-
-  EXPECT_THAT(buffer, StrEq(R"(
-  filler_full_huge_pages: 3
-  filler_partial_huge_pages: 3
-  filler_released_huge_pages: 2
-  filler_partially_released_huge_pages: 0
-  filler_free_pages: 261
-  filler_used_pages_in_subreleased: 499
-  filler_used_pages_in_partial_released: 0
-  filler_unmapped_bytes: 0
-  filler_hugepageable_used_bytes: 10444800
-  filler_num_pages_subreleased: 269
-  filler_num_hugepages_broken: 3
-  filler_num_pages_subreleased_due_to_limit: 0
-  filler_num_hugepages_broken_due_to_limit: 0
-  filler_tracker {
-    type: REGULAR
-    free_pages_histogram {
-      lower_bound: 0
-      upper_bound: 0
-      value: 3
-    }
-    free_pages_histogram {
-      lower_bound: 1
-      upper_bound: 1
-      value: 1
-    }
-    free_pages_histogram {
-      lower_bound: 2
-      upper_bound: 2
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 3
-      upper_bound: 3
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 4
-      upper_bound: 15
-      value: 1
-    }
-    free_pages_histogram {
-      lower_bound: 16
-      upper_bound: 31
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 32
-      upper_bound: 47
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 48
-      upper_bound: 63
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 64
-      upper_bound: 79
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 80
-      upper_bound: 95
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 96
-      upper_bound: 111
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 112
-      upper_bound: 127
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 128
-      upper_bound: 143
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 144
-      upper_bound: 159
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 160
-      upper_bound: 175
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 176
-      upper_bound: 191
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 192
-      upper_bound: 207
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 208
-      upper_bound: 223
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 224
-      upper_bound: 239
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 240
-      upper_bound: 251
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 252
-      upper_bound: 252
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 253
-      upper_bound: 253
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 254
-      upper_bound: 254
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 255
-      upper_bound: 255
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 0
-      upper_bound: 0
-      value: 3
-    }
-    longest_free_range_histogram {
-      lower_bound: 1
-      upper_bound: 1
-      value: 1
-    }
-    longest_free_range_histogram {
-      lower_bound: 2
-      upper_bound: 2
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 3
-      upper_bound: 3
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 4
-      upper_bound: 15
-      value: 1
-    }
-    longest_free_range_histogram {
-      lower_bound: 16
-      upper_bound: 31
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 32
-      upper_bound: 47
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 48
-      upper_bound: 63
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 64
-      upper_bound: 79
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 80
-      upper_bound: 95
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 96
-      upper_bound: 111
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 112
-      upper_bound: 127
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 128
-      upper_bound: 143
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 144
-      upper_bound: 159
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 160
-      upper_bound: 175
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 176
-      upper_bound: 191
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 192
-      upper_bound: 207
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 208
-      upper_bound: 223
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 224
-      upper_bound: 239
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 240
-      upper_bound: 251
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 252
-      upper_bound: 252
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 253
-      upper_bound: 253
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 254
-      upper_bound: 254
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 255
-      upper_bound: 255
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 1
-      upper_bound: 1
-      value: 1
-    }
-    allocations_histogram {
-      lower_bound: 2
-      upper_bound: 2
-      value: 1
-    }
-    allocations_histogram {
-      lower_bound: 3
-      upper_bound: 3
-      value: 1
-    }
-    allocations_histogram {
-      lower_bound: 4
-      upper_bound: 4
-      value: 2
-    }
-    allocations_histogram {
-      lower_bound: 5
-      upper_bound: 16
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 17
-      upper_bound: 32
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 33
-      upper_bound: 48
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 49
-      upper_bound: 64
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 65
-      upper_bound: 80
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 81
-      upper_bound: 96
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 97
-      upper_bound: 112
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 113
-      upper_bound: 128
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 129
-      upper_bound: 144
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 145
-      upper_bound: 160
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 161
-      upper_bound: 176
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 177
-      upper_bound: 192
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 193
-      upper_bound: 208
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 209
-      upper_bound: 224
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 225
-      upper_bound: 240
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 241
-      upper_bound: 252
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 253
-      upper_bound: 253
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 254
-      upper_bound: 254
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 255
-      upper_bound: 255
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 256
-      upper_bound: 256
-      value: 0
-    }
-  }
-  filler_tracker {
-    type: DONATED
-    free_pages_histogram {
-      lower_bound: 0
-      upper_bound: 0
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 1
-      upper_bound: 1
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 2
-      upper_bound: 2
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 3
-      upper_bound: 3
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 4
-      upper_bound: 15
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 16
-      upper_bound: 31
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 32
-      upper_bound: 47
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 48
-      upper_bound: 63
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 64
-      upper_bound: 79
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 80
-      upper_bound: 95
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 96
-      upper_bound: 111
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 112
-      upper_bound: 127
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 128
-      upper_bound: 143
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 144
-      upper_bound: 159
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 160
-      upper_bound: 175
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 176
-      upper_bound: 191
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 192
-      upper_bound: 207
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 208
-      upper_bound: 223
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 224
-      upper_bound: 239
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 240
-      upper_bound: 251
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 252
-      upper_bound: 252
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 253
-      upper_bound: 253
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 254
-      upper_bound: 254
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 255
-      upper_bound: 255
-      value: 1
-    }
-    longest_free_range_histogram {
-      lower_bound: 0
-      upper_bound: 0
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 1
-      upper_bound: 1
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 2
-      upper_bound: 2
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 3
-      upper_bound: 3
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 4
-      upper_bound: 15
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 16
-      upper_bound: 31
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 32
-      upper_bound: 47
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 48
-      upper_bound: 63
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 64
-      upper_bound: 79
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 80
-      upper_bound: 95
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 96
-      upper_bound: 111
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 112
-      upper_bound: 127
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 128
-      upper_bound: 143
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 144
-      upper_bound: 159
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 160
-      upper_bound: 175
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 176
-      upper_bound: 191
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 192
-      upper_bound: 207
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 208
-      upper_bound: 223
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 224
-      upper_bound: 239
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 240
-      upper_bound: 251
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 252
-      upper_bound: 252
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 253
-      upper_bound: 253
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 254
-      upper_bound: 254
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 255
-      upper_bound: 255
-      value: 1
-    }
-    allocations_histogram {
-      lower_bound: 1
-      upper_bound: 1
-      value: 1
-    }
-    allocations_histogram {
-      lower_bound: 2
-      upper_bound: 2
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 3
-      upper_bound: 3
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 4
-      upper_bound: 4
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 5
-      upper_bound: 16
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 17
-      upper_bound: 32
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 33
-      upper_bound: 48
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 49
-      upper_bound: 64
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 65
-      upper_bound: 80
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 81
-      upper_bound: 96
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 97
-      upper_bound: 112
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 113
-      upper_bound: 128
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 129
-      upper_bound: 144
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 145
-      upper_bound: 160
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 161
-      upper_bound: 176
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 177
-      upper_bound: 192
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 193
-      upper_bound: 208
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 209
-      upper_bound: 224
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 225
-      upper_bound: 240
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 241
-      upper_bound: 252
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 253
-      upper_bound: 253
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 254
-      upper_bound: 254
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 255
-      upper_bound: 255
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 256
-      upper_bound: 256
-      value: 0
-    }
-  }
-  filler_tracker {
-    type: PARTIAL
-    free_pages_histogram {
-      lower_bound: 0
-      upper_bound: 0
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 1
-      upper_bound: 1
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 2
-      upper_bound: 2
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 3
-      upper_bound: 3
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 4
-      upper_bound: 15
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 16
-      upper_bound: 31
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 32
-      upper_bound: 47
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 48
-      upper_bound: 63
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 64
-      upper_bound: 79
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 80
-      upper_bound: 95
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 96
-      upper_bound: 111
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 112
-      upper_bound: 127
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 128
-      upper_bound: 143
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 144
-      upper_bound: 159
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 160
-      upper_bound: 175
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 176
-      upper_bound: 191
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 192
-      upper_bound: 207
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 208
-      upper_bound: 223
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 224
-      upper_bound: 239
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 240
-      upper_bound: 251
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 252
-      upper_bound: 252
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 253
-      upper_bound: 253
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 254
-      upper_bound: 254
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 255
-      upper_bound: 255
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 0
-      upper_bound: 0
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 1
-      upper_bound: 1
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 2
-      upper_bound: 2
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 3
-      upper_bound: 3
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 4
-      upper_bound: 15
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 16
-      upper_bound: 31
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 32
-      upper_bound: 47
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 48
-      upper_bound: 63
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 64
-      upper_bound: 79
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 80
-      upper_bound: 95
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 96
-      upper_bound: 111
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 112
-      upper_bound: 127
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 128
-      upper_bound: 143
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 144
-      upper_bound: 159
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 160
-      upper_bound: 175
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 176
-      upper_bound: 191
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 192
-      upper_bound: 207
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 208
-      upper_bound: 223
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 224
-      upper_bound: 239
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 240
-      upper_bound: 251
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 252
-      upper_bound: 252
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 253
-      upper_bound: 253
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 254
-      upper_bound: 254
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 255
-      upper_bound: 255
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 1
-      upper_bound: 1
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 2
-      upper_bound: 2
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 3
-      upper_bound: 3
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 4
-      upper_bound: 4
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 5
-      upper_bound: 16
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 17
-      upper_bound: 32
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 33
-      upper_bound: 48
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 49
-      upper_bound: 64
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 65
-      upper_bound: 80
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 81
-      upper_bound: 96
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 97
-      upper_bound: 112
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 113
-      upper_bound: 128
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 129
-      upper_bound: 144
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 145
-      upper_bound: 160
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 161
-      upper_bound: 176
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 177
-      upper_bound: 192
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 193
-      upper_bound: 208
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 209
-      upper_bound: 224
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 225
-      upper_bound: 240
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 241
-      upper_bound: 252
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 253
-      upper_bound: 253
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 254
-      upper_bound: 254
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 255
-      upper_bound: 255
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 256
-      upper_bound: 256
-      value: 0
-    }
-  }
-  filler_tracker {
-    type: RELEASED
-    free_pages_histogram {
-      lower_bound: 0
-      upper_bound: 0
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 1
-      upper_bound: 1
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 2
-      upper_bound: 2
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 3
-      upper_bound: 3
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 4
-      upper_bound: 15
-      value: 2
-    }
-    free_pages_histogram {
-      lower_bound: 16
-      upper_bound: 31
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 32
-      upper_bound: 47
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 48
-      upper_bound: 63
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 64
-      upper_bound: 79
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 80
-      upper_bound: 95
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 96
-      upper_bound: 111
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 112
-      upper_bound: 127
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 128
-      upper_bound: 143
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 144
-      upper_bound: 159
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 160
-      upper_bound: 175
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 176
-      upper_bound: 191
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 192
-      upper_bound: 207
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 208
-      upper_bound: 223
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 224
-      upper_bound: 239
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 240
-      upper_bound: 251
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 252
-      upper_bound: 252
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 253
-      upper_bound: 253
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 254
-      upper_bound: 254
-      value: 0
-    }
-    free_pages_histogram {
-      lower_bound: 255
-      upper_bound: 255
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 0
-      upper_bound: 0
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 1
-      upper_bound: 1
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 2
-      upper_bound: 2
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 3
-      upper_bound: 3
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 4
-      upper_bound: 15
-      value: 2
-    }
-    longest_free_range_histogram {
-      lower_bound: 16
-      upper_bound: 31
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 32
-      upper_bound: 47
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 48
-      upper_bound: 63
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 64
-      upper_bound: 79
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 80
-      upper_bound: 95
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 96
-      upper_bound: 111
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 112
-      upper_bound: 127
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 128
-      upper_bound: 143
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 144
-      upper_bound: 159
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 160
-      upper_bound: 175
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 176
-      upper_bound: 191
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 192
-      upper_bound: 207
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 208
-      upper_bound: 223
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 224
-      upper_bound: 239
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 240
-      upper_bound: 251
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 252
-      upper_bound: 252
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 253
-      upper_bound: 253
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 254
-      upper_bound: 254
-      value: 0
-    }
-    longest_free_range_histogram {
-      lower_bound: 255
-      upper_bound: 255
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 1
-      upper_bound: 1
-      value: 2
-    }
-    allocations_histogram {
-      lower_bound: 2
-      upper_bound: 2
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 3
-      upper_bound: 3
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 4
-      upper_bound: 4
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 5
-      upper_bound: 16
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 17
-      upper_bound: 32
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 33
-      upper_bound: 48
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 49
-      upper_bound: 64
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 65
-      upper_bound: 80
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 81
-      upper_bound: 96
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 97
-      upper_bound: 112
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 113
-      upper_bound: 128
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 129
-      upper_bound: 144
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 145
-      upper_bound: 160
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 161
-      upper_bound: 176
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 177
-      upper_bound: 192
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 193
-      upper_bound: 208
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 209
-      upper_bound: 224
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 225
-      upper_bound: 240
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 241
-      upper_bound: 252
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 253
-      upper_bound: 253
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 254
-      upper_bound: 254
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 255
-      upper_bound: 255
-      value: 0
-    }
-    allocations_histogram {
-      lower_bound: 256
-      upper_bound: 256
-      value: 0
-    }
-  }
-  filler_skipped_subrelease {
-    skipped_subrelease_interval_ms: 0
-    skipped_subrelease_pages: 0
-    correctly_skipped_subrelease_pages: 0
-    pending_skipped_subrelease_pages: 0
-    skipped_subrelease_count: 0
-    correctly_skipped_subrelease_count: 0
-    pending_skipped_subrelease_count: 0
-  }
-  filler_stats_timeseries {
-    window_ms: 1000
-    epochs: 600
-    min_free_pages_interval_ms: 300000
-    min_free_pages: 0
-    min_free_backed_pages: 0
-    measurements {
-      epoch: 599
-      timestamp_ms: 0
-      min_free_pages: 0
-      min_free_backed_pages: 0
-      num_pages_subreleased: 269
-      num_hugepages_broken: 3
-      at_minimum_demand {
-        num_pages: 0
-        regular_huge_pages: 0
-        donated_huge_pages: 0
-        partial_released_huge_pages: 0
-        released_huge_pages: 0
-        used_pages_in_subreleased_huge_pages: 0
-      }
-      at_maximum_demand {
-        num_pages: 1774
-        regular_huge_pages: 5
-        donated_huge_pages: 1
-        partial_released_huge_pages: 0
-        released_huge_pages: 2
-        used_pages_in_subreleased_huge_pages: 499
-      }
-      at_minimum_huge_pages {
-        num_pages: 0
-        regular_huge_pages: 0
-        donated_huge_pages: 0
-        partial_released_huge_pages: 0
-        released_huge_pages: 0
-        used_pages_in_subreleased_huge_pages: 0
-      }
-      at_maximum_huge_pages {
-        num_pages: 1774
-        regular_huge_pages: 5
-        donated_huge_pages: 1
-        partial_released_huge_pages: 0
-        released_huge_pages: 2
-        used_pages_in_subreleased_huge_pages: 499
-      }
-    }
-  }
-)"));
-  for (const auto& alloc : allocs) {
-    Delete(alloc);
-  }
 }
 
 // Testing subrelase stats: ensure that the cumulative number of released
@@ -3520,8 +2450,16 @@ TEST_P(FillerTest, CheckSubreleaseStats) {
   std::vector<PAlloc> result;
   static_assert(kPagesPerHugePage > Length(10),
                 "Not enough pages per hugepage!");
+  // Fix the object count since very specific statistics are being tested.
+  const AccessDensityPrediction kDensity =
+      absl::Bernoulli(gen_, 0.5) ? AccessDensityPrediction::kSparse
+                                 : AccessDensityPrediction::kDense;
+  const size_t kObjects = (1 << absl::Uniform<size_t>(gen_, 0, 8));
+  const SpanAllocInfo kAllocInfo = {kObjects, kDensity};
+
   for (int i = 0; i < 10; ++i) {
-    result.push_back(Allocate(kPagesPerHugePage - Length(i + 1)));
+    result.push_back(AllocateWithSpanAllocInfo(
+        kPagesPerHugePage - Length(i + 1), kAllocInfo));
   }
 
   // Breaking up 2 hugepages, releasing 19 pages due to reaching limit,
@@ -3531,6 +2469,7 @@ TEST_P(FillerTest, CheckSubreleaseStats) {
   Advance(absl::Minutes(1));
   SubreleaseStats subrelease = filler_.subrelease_stats();
   EXPECT_EQ(subrelease.total_pages_subreleased, Length(0));
+  EXPECT_EQ(subrelease.total_partial_alloc_pages_subreleased, Length(0));
   EXPECT_EQ(subrelease.total_hugepages_broken.raw_num(), 0);
   EXPECT_EQ(subrelease.num_pages_subreleased, Length(19));
   EXPECT_EQ(subrelease.num_hugepages_broken.raw_num(), 2);
@@ -3539,10 +2478,11 @@ TEST_P(FillerTest, CheckSubreleaseStats) {
 
   // Do some work so that the timeseries updates its stats
   for (int i = 0; i < 5; ++i) {
-    result.push_back(Allocate(Length(1)));
+    result.push_back(AllocateWithSpanAllocInfo(Length(1), kAllocInfo));
   }
   subrelease = filler_.subrelease_stats();
   EXPECT_EQ(subrelease.total_pages_subreleased, Length(19));
+  EXPECT_EQ(subrelease.total_partial_alloc_pages_subreleased, Length(0));
   EXPECT_EQ(subrelease.total_hugepages_broken.raw_num(), 2);
   EXPECT_EQ(subrelease.num_pages_subreleased, Length(0));
   EXPECT_EQ(subrelease.num_hugepages_broken.raw_num(), 0);
@@ -3556,6 +2496,7 @@ TEST_P(FillerTest, CheckSubreleaseStats) {
 
   subrelease = filler_.subrelease_stats();
   EXPECT_EQ(subrelease.total_pages_subreleased, Length(19));
+  EXPECT_EQ(subrelease.total_partial_alloc_pages_subreleased, Length(0));
   EXPECT_EQ(subrelease.total_hugepages_broken.raw_num(), 2);
   EXPECT_EQ(subrelease.num_pages_subreleased, Length(21));
   EXPECT_EQ(subrelease.num_hugepages_broken.raw_num(), 3);
@@ -3565,10 +2506,11 @@ TEST_P(FillerTest, CheckSubreleaseStats) {
   Advance(absl::Minutes(10));  // This forces timeseries to wrap
   // Do some work
   for (int i = 0; i < 5; ++i) {
-    result.push_back(Allocate(Length(1)));
+    result.push_back(AllocateWithSpanAllocInfo(Length(1), kAllocInfo));
   }
   subrelease = filler_.subrelease_stats();
   EXPECT_EQ(subrelease.total_pages_subreleased, Length(40));
+  EXPECT_EQ(subrelease.total_partial_alloc_pages_subreleased, Length(0));
   EXPECT_EQ(subrelease.total_hugepages_broken.raw_num(), 5);
   EXPECT_EQ(subrelease.num_pages_subreleased, Length(0));
   EXPECT_EQ(subrelease.num_hugepages_broken.raw_num(), 0);
@@ -3590,7 +2532,8 @@ TEST_P(FillerTest, CheckSubreleaseStats) {
           "limit)"));
   ASSERT_THAT(buffer, testing::EndsWith(
                           "HugePageFiller: Subrelease stats last 10 min: total "
-                          "21 pages subreleased, 3 hugepages broken\n"));
+                          "21 pages subreleased (0 pages from partial allocs), "
+                          "3 hugepages broken\n"));
 
   for (const auto& alloc : result) {
     Delete(alloc);
@@ -3613,8 +2556,9 @@ TEST_P(FillerTest, ConstantBrokenHugePages) {
     auto size =
         Length(absl::Uniform<size_t>(rng, 2, kPagesPerHugePage.raw_num() - 1));
     alloc_small.push_back(Allocate(Length(1)));
-    alloc.push_back(Allocate(size - Length(1)));
-    dead.push_back(Allocate(kPagesPerHugePage - size));
+    SpanAllocInfo info = alloc_small.back().span_alloc_info;
+    alloc.push_back(AllocateWithSpanAllocInfo(size - Length(1), info));
+    dead.push_back(AllocateWithSpanAllocInfo(kPagesPerHugePage - size, info));
   }
   ASSERT_EQ(filler_.size(), kHugePages);
 
@@ -3679,14 +2623,13 @@ TEST_P(FillerTest, CheckBufferSize) {
   std::string buffer(1024 * 1024, '\0');
   Printer printer(&*buffer.begin(), buffer.size());
   {
-    PbtxtRegion region(&printer, kTop, /*indent=*/0);
+    PbtxtRegion region(&printer, kTop);
     filler_.PrintInPbtxt(&region);
   }
 
   // We assume a maximum buffer size of 1 MiB. When increasing this size, ensure
   // that all places processing mallocz protos get updated as well.
   size_t buffer_size = printer.SpaceRequired();
-  printf("HugePageFiller buffer size: %zu\n", buffer_size);
   EXPECT_LE(buffer_size, 1024 * 1024);
 }
 
@@ -3704,7 +2647,7 @@ TEST_P(FillerTest, ReleasePriority) {
   std::vector<PAlloc> dead;
   dead.reserve(kHugePages.raw_num());
 
-  absl::flat_hash_set<FakeTracker*> unique_pages;
+  absl::flat_hash_set<PageTracker*> unique_pages;
   unique_pages.reserve(kHugePages.raw_num());
 
   for (HugeLength i; i < kHugePages; ++i) {
@@ -3713,7 +2656,8 @@ TEST_P(FillerTest, ReleasePriority) {
     PAlloc a = Allocate(size);
     unique_pages.insert(a.pt);
     alloc.push_back(a);
-    dead.push_back(Allocate(kPagesPerHugePage - size));
+    dead.push_back(
+        AllocateWithSpanAllocInfo(kPagesPerHugePage - size, a.span_alloc_info));
   }
 
   ASSERT_EQ(filler_.size(), kHugePages);
@@ -3724,7 +2668,7 @@ TEST_P(FillerTest, ReleasePriority) {
 
   // As of 5/2020, our release priority is to subrelease huge pages with the
   // fewest used pages.  Bucket unique_pages by that used_pages().
-  std::vector<std::vector<FakeTracker*>> ordered(kPagesPerHugePage.raw_num());
+  std::vector<std::vector<PageTracker*>> ordered(kPagesPerHugePage.raw_num());
   for (auto* pt : unique_pages) {
     // None of these should be released yet.
     EXPECT_FALSE(pt->released());
@@ -3790,9 +2734,521 @@ TEST_P(FillerTest, ReleasePriority) {
   }
 }
 
-INSTANTIATE_TEST_SUITE_P(All, FillerTest,
-                         testing::Values(FillerPartialRerelease::Return,
-                                         FillerPartialRerelease::Retain));
+TEST_P(FillerTest, b258965495) {
+  // 1 huge page:  2 pages allocated, kPagesPerHugePage-2 free, 0 released
+  auto a1 = Allocate(Length(2));
+  EXPECT_EQ(filler_.size(), NHugePages(1));
+
+  ASSERT_TRUE(blocking_unback_.success_);
+  // 1 huge page:  2 pages allocated, 0 free, kPagesPerHugePage-2 released
+  EXPECT_EQ(HardReleasePages(kPagesPerHugePage), kPagesPerHugePage - Length(2));
+
+  blocking_unback_.success_ = false;
+  // 1 huge page:  3 pages allocated, 0 free, kPagesPerHugePage-3 released
+  auto a2 = AllocateWithSpanAllocInfo(Length(1), a1.span_alloc_info);
+  EXPECT_EQ(filler_.size(), NHugePages(1));
+  // Even if PartialRerelease::Return, returning a2 fails, so a2's pages stay
+  // freed rather than released.
+  //
+  // 1 huge page:  2 pages allocated, 1 free, kPagesPerHugePage-3 released
+  Delete(a2);
+
+  blocking_unback_.success_ = true;
+  // During the deallocation of a1 under PartialRerelease::Return, but before we
+  // mark the pages as free (PageTracker::MaybeRelease), we have:
+  //
+  // 1 huge page:  2 pages allocated, 1 free, kPagesPerHugePage-1 released
+  //
+  // The page appears fully (free_pages() <= released_pages()), rather than
+  // partially released, so we look for it on the wrong list.
+  Delete(a1);
+}
+
+TEST_P(FillerTest, CheckFillerStats) {
+  // Skip test for single alloc as we test for non-zero hardened output.
+  if (std::get<0>(GetParam()) == HugePageFillerAllocsOption::kUnifiedAllocs) {
+    GTEST_SKIP() << "Skipping test for kUnifiedAllocs";
+  }
+  if (kPagesPerHugePage != Length(256)) {
+    // The output is hardcoded on this assumption, and dynamically calculating
+    // it would be way too much of a pain.
+    return;
+  }
+  // We prevent randomly choosing the number of objects per span since this
+  // test has hardcoded output which will change if the objects per span are
+  // chosen at random.
+  randomize_density_ = false;
+  auto allocs = GenerateInterestingAllocs();
+
+  const HugePageFillerStats stats = filler_.GetStats();
+  for (int i = 0; i < AccessDensityPrediction::kPredictionCounts; ++i) {
+    EXPECT_GE(stats.n_fully_released[i].raw_num(), 0);
+  }
+  // Check sparsely-accessed filler stats.
+  EXPECT_EQ(stats.n_fully_released[AccessDensityPrediction::kSparse].raw_num(),
+            2);
+  EXPECT_EQ(stats.n_released[AccessDensityPrediction::kSparse].raw_num(), 2);
+  EXPECT_EQ(
+      stats.n_partial_released[AccessDensityPrediction::kSparse].raw_num(), 0);
+  EXPECT_EQ(stats.n_total[AccessDensityPrediction::kSparse].raw_num(), 8);
+  EXPECT_EQ(stats.n_full[AccessDensityPrediction::kSparse].raw_num(), 3);
+  EXPECT_EQ(stats.n_partial[AccessDensityPrediction::kSparse].raw_num(), 3);
+
+  // Check densely-accessed filler stats.
+  EXPECT_EQ(stats.n_fully_released[AccessDensityPrediction::kDense].raw_num(),
+            2);
+  EXPECT_EQ(stats.n_released[AccessDensityPrediction::kDense].raw_num(), 2);
+  EXPECT_EQ(stats.n_partial_released[AccessDensityPrediction::kDense].raw_num(),
+            0);
+  EXPECT_EQ(stats.n_total[AccessDensityPrediction::kDense].raw_num(), 7);
+  EXPECT_EQ(stats.n_full[AccessDensityPrediction::kDense].raw_num(), 3);
+  EXPECT_EQ(stats.n_partial[AccessDensityPrediction::kDense].raw_num(), 2);
+
+  // Check total filler stats.
+  EXPECT_EQ(stats.n_fully_released[AccessDensityPrediction::kPredictionCounts]
+                .raw_num(),
+            4);
+  EXPECT_EQ(
+      stats.n_released[AccessDensityPrediction::kPredictionCounts].raw_num(),
+      4);
+  EXPECT_EQ(stats.n_partial_released[AccessDensityPrediction::kPredictionCounts]
+                .raw_num(),
+            0);
+  EXPECT_EQ(stats.n_total[AccessDensityPrediction::kPredictionCounts].raw_num(),
+            15);
+  EXPECT_EQ(stats.n_full[AccessDensityPrediction::kPredictionCounts].raw_num(),
+            6);
+  EXPECT_EQ(
+      stats.n_partial[AccessDensityPrediction::kPredictionCounts].raw_num(), 5);
+
+  for (const auto& alloc : allocs) {
+    Delete(alloc);
+  }
+}
+
+// Test the output of Print(). This is something of a change-detector test,
+// but that's not all bad in this case.
+TEST_P(FillerTest, Print) {
+  // Skip test for single alloc as we test for non-zero hardened output.
+  if (std::get<0>(GetParam()) == HugePageFillerAllocsOption::kUnifiedAllocs) {
+    GTEST_SKIP() << "Skipping test for kUnifiedAllocs";
+  }
+  if (kPagesPerHugePage != Length(256)) {
+    // The output is hardcoded on this assumption, and dynamically calculating
+    // it would be way too much of a pain.
+    return;
+  }
+  // We prevent randomly choosing the number of objects per span since this
+  // test has hardcoded output which will change if the objects per span are
+  // chosen at random.
+  randomize_density_ = false;
+  auto allocs = GenerateInterestingAllocs();
+
+  std::string buffer(1024 * 1024, '\0');
+  {
+    Printer printer(&*buffer.begin(), buffer.size());
+    filler_.Print(&printer, /*everything=*/true);
+    buffer.erase(printer.SpaceRequired());
+  }
+
+  EXPECT_THAT(
+      buffer,
+      StrEq(R"(HugePageFiller: densely pack small requests into hugepages
+HugePageFiller: Overall, 15 total, 6 full, 5 partial, 4 released (0 partially), 0 quarantined
+HugePageFiller: those with sparsely-accessed spans, 8 total, 3 full, 3 partial, 2 released (0 partially), 0 quarantined
+HugePageFiller: those with densely-accessed spans, 7 total, 3 full, 2 partial, 2 released (0 partially), 0 quarantined
+HugePageFiller: 267 pages free in 15 hugepages, 0.0695 free
+HugePageFiller: among non-fulls, 0.2086 free
+HugePageFiller: 998 used pages in subreleased hugepages (0 of them in partially released)
+HugePageFiller: 4 hugepages partially released, 0.0254 released
+HugePageFiller: 0.7186 of used pages hugepageable
+HugePageFiller: 0 hugepages were previously released, but later became full.
+HugePageFiller: Since startup, 282 pages subreleased, 5 hugepages broken, (0 pages, 0 hugepages due to reaching tcmalloc limit)
+
+HugePageFiller: fullness histograms
+
+HugePageFiller: # of sparsely-accessed regular hps with a<= # of free pages <b
+HugePageFiller: <  0<=     3 <  1<=     1 <  2<=     0 <  3<=     0 <  4<=     1 < 16<=     0
+HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
+HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
+HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
+
+HugePageFiller: # of densely-accessed regular hps with a<= # of free pages <b
+HugePageFiller: <  0<=     3 <  1<=     1 <  2<=     0 <  3<=     0 <  4<=     1 < 16<=     0
+HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
+HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
+HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
+
+HugePageFiller: # of donated hps with a<= # of free pages <b
+HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     0 < 16<=     0
+HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
+HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
+HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     1
+
+HugePageFiller: # of sparsely-accessed partial released hps with a<= # of free pages <b
+HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     0 < 16<=     0
+HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
+HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
+HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
+
+HugePageFiller: # of densely-accessed partial released hps with a<= # of free pages <b
+HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     0 < 16<=     0
+HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
+HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
+HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
+
+HugePageFiller: # of sparsely-accessed released hps with a<= # of free pages <b
+HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     2 < 16<=     0
+HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
+HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
+HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
+
+HugePageFiller: # of densely-accessed released hps with a<= # of free pages <b
+HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     2 < 16<=     0
+HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
+HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
+HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
+
+HugePageFiller: # of sparsely-accessed regular hps with a<= longest free range <b
+HugePageFiller: <  0<=     3 <  1<=     1 <  2<=     0 <  3<=     0 <  4<=     1 < 16<=     0
+HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
+HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
+HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
+
+HugePageFiller: # of densely-accessed regular hps with a<= longest free range <b
+HugePageFiller: <  0<=     3 <  1<=     1 <  2<=     0 <  3<=     0 <  4<=     1 < 16<=     0
+HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
+HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
+HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
+
+HugePageFiller: # of sparsely-accessed partial released hps with a<= longest free range <b
+HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     0 < 16<=     0
+HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
+HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
+HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
+
+HugePageFiller: # of densely-accessed partial released hps with a<= longest free range <b
+HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     0 < 16<=     0
+HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
+HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
+HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
+
+HugePageFiller: # of sparsely-accessed released hps with a<= longest free range <b
+HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     2 < 16<=     0
+HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
+HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
+HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
+
+HugePageFiller: # of densely-accessed released hps with a<= longest free range <b
+HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     2 < 16<=     0
+HugePageFiller: < 32<=     0 < 48<=     0 < 64<=     0 < 80<=     0 < 96<=     0 <112<=     0
+HugePageFiller: <128<=     0 <144<=     0 <160<=     0 <176<=     0 <192<=     0 <208<=     0
+HugePageFiller: <224<=     0 <240<=     0 <252<=     0 <253<=     0 <254<=     0 <255<=     0
+
+HugePageFiller: # of sparsely-accessed regular hps with a<= # of allocations <b
+HugePageFiller: <  1<=     1 <  2<=     1 <  3<=     1 <  4<=     2 <  5<=     0 < 17<=     0
+HugePageFiller: < 33<=     0 < 49<=     0 < 65<=     0 < 81<=     0 < 97<=     0 <113<=     0
+HugePageFiller: <129<=     0 <145<=     0 <161<=     0 <177<=     0 <193<=     0 <209<=     0
+HugePageFiller: <225<=     0 <241<=     0 <253<=     0 <254<=     0 <255<=     0 <256<=     0
+
+HugePageFiller: # of densely-accessed regular hps with a<= # of allocations <b
+HugePageFiller: <  1<=     1 <  2<=     1 <  3<=     1 <  4<=     2 <  5<=     0 < 17<=     0
+HugePageFiller: < 33<=     0 < 49<=     0 < 65<=     0 < 81<=     0 < 97<=     0 <113<=     0
+HugePageFiller: <129<=     0 <145<=     0 <161<=     0 <177<=     0 <193<=     0 <209<=     0
+HugePageFiller: <225<=     0 <241<=     0 <253<=     0 <254<=     0 <255<=     0 <256<=     0
+
+HugePageFiller: # of sparsely-accessed partial released hps with a<= # of allocations <b
+HugePageFiller: <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     0 <  5<=     0 < 17<=     0
+HugePageFiller: < 33<=     0 < 49<=     0 < 65<=     0 < 81<=     0 < 97<=     0 <113<=     0
+HugePageFiller: <129<=     0 <145<=     0 <161<=     0 <177<=     0 <193<=     0 <209<=     0
+HugePageFiller: <225<=     0 <241<=     0 <253<=     0 <254<=     0 <255<=     0 <256<=     0
+
+HugePageFiller: # of densely-accessed partial released hps with a<= # of allocations <b
+HugePageFiller: <  1<=     0 <  2<=     0 <  3<=     0 <  4<=     0 <  5<=     0 < 17<=     0
+HugePageFiller: < 33<=     0 < 49<=     0 < 65<=     0 < 81<=     0 < 97<=     0 <113<=     0
+HugePageFiller: <129<=     0 <145<=     0 <161<=     0 <177<=     0 <193<=     0 <209<=     0
+HugePageFiller: <225<=     0 <241<=     0 <253<=     0 <254<=     0 <255<=     0 <256<=     0
+
+HugePageFiller: # of sparsely-accessed released hps with a<= # of allocations <b
+HugePageFiller: <  1<=     2 <  2<=     0 <  3<=     0 <  4<=     0 <  5<=     0 < 17<=     0
+HugePageFiller: < 33<=     0 < 49<=     0 < 65<=     0 < 81<=     0 < 97<=     0 <113<=     0
+HugePageFiller: <129<=     0 <145<=     0 <161<=     0 <177<=     0 <193<=     0 <209<=     0
+HugePageFiller: <225<=     0 <241<=     0 <253<=     0 <254<=     0 <255<=     0 <256<=     0
+
+HugePageFiller: # of densely-accessed released hps with a<= # of allocations <b
+HugePageFiller: <  1<=     2 <  2<=     0 <  3<=     0 <  4<=     0 <  5<=     0 < 17<=     0
+HugePageFiller: < 33<=     0 < 49<=     0 < 65<=     0 < 81<=     0 < 97<=     0 <113<=     0
+HugePageFiller: <129<=     0 <145<=     0 <161<=     0 <177<=     0 <193<=     0 <209<=     0
+HugePageFiller: <225<=     0 <241<=     0 <253<=     0 <254<=     0 <255<=     0 <256<=     0
+
+HugePageFiller: time series over 5 min interval
+
+HugePageFiller: realized fragmentation: 0.0 MiB
+HugePageFiller: minimum free pages: 0 (0 backed)
+HugePageFiller: at peak demand: 3547 pages (and 267 free, 26 unmapped)
+HugePageFiller: at peak demand: 15 hps (10 regular, 1 donated, 0 partial, 4 released)
+HugePageFiller: at peak hps: 3547 pages (and 267 free, 26 unmapped)
+HugePageFiller: at peak hps: 15 hps (10 regular, 1 donated, 0 partial, 4 released)
+
+HugePageFiller: Since the start of the execution, 0 subreleases (0 pages) were skipped due to either recent (0s) peaks, or the sum of short-term (0s) fluctuations and long-term (0s) trends.
+HugePageFiller: 0.0000% of decisions confirmed correct, 0 pending (0.0000% of pages, 0 pending), as per anticipated 0s realized fragmentation.
+HugePageFiller: Subrelease stats last 10 min: total 282 pages subreleased (0 pages from partial allocs), 5 hugepages broken
+)"));
+  for (const auto& alloc : allocs) {
+    Delete(alloc);
+  }
+}
+
+// Test Get and Put operations on the filler work correctly when number of
+// objects are provided.  We expect that Get requests with sparsely-accessed
+// and densely-accessed spans are satisfied by their respective allocs.
+TEST_P(FillerTest, GetsAndPuts) {
+  // TODO(b/295252832): remove the skipping part once the two separate allocs
+  // become the only option.
+  if (std::get<0>(GetParam()) == HugePageFillerAllocsOption::kUnifiedAllocs) {
+    GTEST_SKIP() << "Skipping test for kUnifiedAllocs";
+  }
+
+  randomize_density_ = false;
+  absl::BitGen rng;
+  std::vector<PAlloc> sparsely_accessed_allocs;
+  std::vector<PAlloc> densely_accessed_allocs;
+  SpanAllocInfo sparsely_accessed_info = {1, AccessDensityPrediction::kSparse};
+  SpanAllocInfo densely_accessed_info = {kMaxValidPages.raw_num(),
+                                         AccessDensityPrediction::kDense};
+  static const HugeLength kNumHugePages = NHugePages(64);
+  for (auto i = Length(0); i < kNumHugePages.in_pages(); ++i) {
+    ASSERT_EQ(filler_.pages_allocated(), i);
+    // Randomly select whether the next span should be sparsely-accessed or
+    // densely-accessed.
+    if (absl::Bernoulli(rng, 0.5)) {
+      sparsely_accessed_allocs.push_back(
+          AllocateWithSpanAllocInfo(Length(1), sparsely_accessed_info));
+      EXPECT_EQ(
+          filler_.pages_allocated(AccessDensityPrediction::kSparse).raw_num(),
+          sparsely_accessed_allocs.size());
+    } else {
+      densely_accessed_allocs.push_back(
+          AllocateWithSpanAllocInfo(Length(1), densely_accessed_info));
+      EXPECT_EQ(
+          filler_.pages_allocated(AccessDensityPrediction::kDense).raw_num(),
+          densely_accessed_allocs.size());
+    }
+  }
+  EXPECT_GE(filler_.size(), kNumHugePages);
+  EXPECT_LE(filler_.size(), kNumHugePages + NHugePages(1));
+  // clean up, check for failures
+  for (auto a : densely_accessed_allocs) {
+    Delete(a);
+  }
+  ASSERT_EQ(filler_.pages_allocated(AccessDensityPrediction::kDense),
+            Length(0));
+  for (auto a : sparsely_accessed_allocs) {
+    Delete(a);
+  }
+  ASSERT_EQ(filler_.pages_allocated(AccessDensityPrediction::kSparse),
+            Length(0));
+  ASSERT_EQ(filler_.pages_allocated(), Length(0));
+}
+
+// Test that filler tries to release pages from the sparsely-accessed allocs
+// before attempting to release pages from the densely-accessed allocs.
+TEST_P(FillerTest, ReleasePrioritySparseAndDenseAllocs) {
+  // TODO(b/295252832): remove the skipping part once the two separate allocs
+  // become the only option.
+  if (std::get<0>(GetParam()) == HugePageFillerAllocsOption::kUnifiedAllocs) {
+    GTEST_SKIP() << "Skipping test for kUnifiedAllocs";
+  }
+
+  randomize_density_ = false;
+  const Length N = kPagesPerHugePage;
+  const Length kToBeReleased(4);
+  SpanAllocInfo sparsely_accessed_info = {1, AccessDensityPrediction::kSparse};
+  auto sparsely_accessed_alloc =
+      AllocateWithSpanAllocInfo(N - kToBeReleased, sparsely_accessed_info);
+  SpanAllocInfo densely_accessed_info = {kMaxValidPages.raw_num(),
+                                         AccessDensityPrediction::kDense};
+  auto densely_accessed_alloc =
+      AllocateWithSpanAllocInfo(N - kToBeReleased, densely_accessed_info);
+  EXPECT_EQ(ReleasePages(Length(1)), kToBeReleased);
+  EXPECT_EQ(sparsely_accessed_alloc.pt->released_pages(), kToBeReleased);
+  EXPECT_EQ(densely_accessed_alloc.pt->released_pages(), Length(0));
+  EXPECT_EQ(ReleasePages(Length(1)), kToBeReleased);
+  EXPECT_EQ(densely_accessed_alloc.pt->released_pages(), kToBeReleased);
+  EXPECT_EQ(sparsely_accessed_alloc.pt->released_pages(), kToBeReleased);
+  Delete(sparsely_accessed_alloc);
+  Delete(densely_accessed_alloc);
+}
+
+// Repeatedly grow from FLAG_bytes to FLAG_bytes * growth factor, then shrink
+// back down by random deletion. Then release partial hugepages until
+// pageheap is bounded by some fraction of usage.  Measure the blowup in VSS
+// footprint.
+TEST_P(FillerTest, BoundedVSS) {
+  randomize_density_ = false;
+  absl::BitGen rng;
+  const Length baseline = LengthFromBytes(absl::GetFlag(FLAGS_bytes));
+  const Length peak = baseline * absl::GetFlag(FLAGS_growth_factor);
+
+  std::vector<PAlloc> allocs;
+  while (filler_.used_pages() < baseline) {
+    allocs.push_back(Allocate(Length(1)));
+  }
+  EXPECT_EQ(filler_.pages_allocated().raw_num(), allocs.size());
+
+  for (int i = 0; i < 10; ++i) {
+    while (filler_.used_pages() < peak) {
+      allocs.push_back(Allocate(Length(1)));
+    }
+    std::shuffle(allocs.begin(), allocs.end(), rng);
+    size_t limit = allocs.size();
+    while (filler_.used_pages() > baseline) {
+      --limit;
+      Delete(allocs[limit]);
+    }
+    allocs.resize(limit);
+    ReleasePages(kMaxValidPages);
+    // Compare the total size of the hugepages in the filler and the allocated
+    // pages.
+    EXPECT_LE(filler_.size().in_bytes(),
+              2 * filler_.pages_allocated().in_bytes());
+  }
+  while (!allocs.empty()) {
+    Delete(allocs.back());
+    allocs.pop_back();
+  }
+}
+
+// In b/265337869, we observed failures in the huge_page_filler due to mixing
+// of hugepages between sparsely-accessed and densely-accessed allocs. The test
+// below reproduces the buggy situation.
+TEST_P(FillerTest, CounterUnderflow) {
+  // The test so specifically needs that both the alloc lists are used.  So, we
+  // skip when using a single alloc list.
+  // TODO(b/295252832): remove the skipping part once the two separate allocs
+  // become the only option.
+  if (std::get<0>(GetParam()) == HugePageFillerAllocsOption::kUnifiedAllocs) {
+    GTEST_SKIP() << "Skipping test for single alloc";
+  }
+
+  randomize_density_ = false;
+  const Length N = kPagesPerHugePage;
+  const Length kToBeReleased(kPagesPerHugePage / 2 + Length(1));
+  // First allocate a densely-accessed span, then release the remaining pages on
+  // the hugepage.  This would move the hugepage to
+  // regular_alloc_partial_released_.
+  SpanAllocInfo densely_accessed_info = {kMaxValidPages.raw_num(),
+                                         AccessDensityPrediction::kDense};
+  auto densely_accessed_alloc =
+      AllocateWithSpanAllocInfo(N - kToBeReleased, densely_accessed_info);
+  EXPECT_EQ(ReleasePages(Length(kToBeReleased)), kToBeReleased);
+  // Then allocate a sparsely-accessed objects span.  The previous hugepage
+  // should not be used since while allocating a sparsely-accessed objects span,
+  // we do not check densely-accessed alloc.
+  SpanAllocInfo sparsely_accessed_info = {1, AccessDensityPrediction::kSparse};
+  auto sparsely_accessed_alloc =
+      AllocateWithSpanAllocInfo(Length(kToBeReleased), sparsely_accessed_info);
+  EXPECT_NE(sparsely_accessed_alloc.pt, densely_accessed_alloc.pt);
+  Delete(sparsely_accessed_alloc);
+  Delete(densely_accessed_alloc);
+}
+
+// In b/270916852, we observed that the huge_page_filler may fail to release
+// memory when densely-accessed alloc is being used.  This is due to the
+// presence of partially released and fully released pages in densely-accessed
+// alloc.  The comparator in use does not make correct choices in presence of
+// such hugepages.  The test below reproduces the buggy situation.
+TEST_P(FillerTest, ReleasePagesFromDenseAlloc) {
+  randomize_density_ = false;
+  constexpr size_t kCandidatesForReleasingMemory =
+      HugePageFiller<PageTracker>::kCandidatesForReleasingMemory;
+  // Make kCandidate memory allocations of length kPagesPerHugepage/2 + 1.  Note
+  // that a fresh hugepage will be used for each alloction.
+  const Length kToBeUsed1(kPagesPerHugePage / 2 + Length(1));
+  std::vector<PAlloc> allocs;
+  SpanAllocInfo densely_accessed_info = {kMaxValidPages.raw_num(),
+                                         AccessDensityPrediction::kDense};
+  for (int i = 0; i < kCandidatesForReleasingMemory; ++i) {
+    allocs.push_back(
+        AllocateWithSpanAllocInfo(kToBeUsed1, densely_accessed_info));
+  }
+  // Release the free portion from these hugepages.
+  const Length kExpectedReleased1 =
+      kCandidatesForReleasingMemory * (kPagesPerHugePage - kToBeUsed1);
+  EXPECT_EQ(ReleasePages(kExpectedReleased1), kExpectedReleased1);
+  //  Allocate kCandidate (does not really matter) more hugepages with
+  //  allocations of length kPagesPerHugepage/2 + 2. These allocations also need
+  //  one fresh hugepage each and they use more pages than the previously
+  //  allocated hugepages.
+  const Length kToBeUsed2(kPagesPerHugePage / 2 + Length(2));
+  for (int i = 0; i < kCandidatesForReleasingMemory; ++i) {
+    allocs.push_back(
+        AllocateWithSpanAllocInfo(kToBeUsed2, densely_accessed_info));
+  }
+  // Try to release more memory.  We should continue to make progress and return
+  // all of the pages we tried to.
+  const Length kExpectedReleased2 =
+      kCandidatesForReleasingMemory * (kPagesPerHugePage - kToBeUsed2);
+  EXPECT_EQ(ReleasePages(kExpectedReleased2), kExpectedReleased2);
+  EXPECT_EQ(filler_.free_pages(), Length(0));
+
+  for (auto alloc : allocs) {
+    Delete(alloc);
+  }
+}
+
+TEST_P(FillerTest, ReleasedPagesStatistics) {
+  constexpr Length N = kPagesPerHugePage / 4;
+
+  PAlloc a1 = Allocate(N);
+
+  const Length released = ReleasePages(kPagesPerHugePage);
+  // We should have released some memory.
+  EXPECT_NE(released, Length(0));
+  // Since we have only a single allocation, its pages should all be used on
+  // released pages.
+  EXPECT_EQ(filler_.size(), NHugePages(1));
+  EXPECT_EQ(filler_.used_pages(), N);
+  EXPECT_EQ(filler_.free_pages(), Length(0));
+  EXPECT_EQ(filler_.used_pages_in_released(), N);
+  EXPECT_EQ(filler_.used_pages_in_any_subreleased(), N);
+
+  // Now differentiate fully released from partially released.  Make an
+  // allocation and return it.
+  PAlloc a2 = AllocateWithSpanAllocInfo(N, a1.span_alloc_info);
+
+  // We now have N pages for a1, N pages for a2, and 2N pages
+  // released.
+  EXPECT_EQ(filler_.size(), NHugePages(1));
+  EXPECT_EQ(filler_.used_pages(), 2 * N);
+  EXPECT_EQ(filler_.free_pages(), Length(0));
+  EXPECT_EQ(filler_.used_pages_in_released(), 2 * N);
+  EXPECT_EQ(filler_.used_pages_in_any_subreleased(), 2 * N);
+
+  Delete(a2);
+
+  // We now have N pages for a1, N pages free (but mapped), and 2N pages
+  // released.
+  EXPECT_EQ(filler_.used_pages(), N);
+  EXPECT_EQ(filler_.free_pages(), N);
+  EXPECT_EQ(filler_.used_pages_in_released(), Length(0));
+  EXPECT_EQ(filler_.used_pages_in_any_subreleased(), N);
+
+  Delete(a1);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    All, FillerTest,
+    testing::Combine(
+        testing::Values(HugePageFillerAllocsOption::kUnifiedAllocs,
+                        HugePageFillerAllocsOption::kSeparateAllocs),
+        testing::Values(8, 12, 16)));
+
+TEST(SkipSubreleaseIntervalsTest, EmptyIsNotEnabled) {
+  // When we have a limit hit, we pass SkipSubreleaseIntervals{} to the
+  // filler. Make sure it doesn't signal that we should skip the limit.
+  EXPECT_FALSE(SkipSubreleaseIntervals{}.SkipSubreleaseEnabled());
+}
 
 }  // namespace
 }  // namespace tcmalloc_internal

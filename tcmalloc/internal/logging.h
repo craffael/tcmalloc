@@ -20,10 +20,18 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#include "absl/base/internal/per_thread_tls.h"
+#include <cstring>
+#include <initializer_list>
+#include <string>
+#include <type_traits>
+
+#include "absl/base/attributes.h"
 #include "absl/base/optimization.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/time.h"
+#include "tcmalloc/internal/allocation_guard.h"
 #include "tcmalloc/internal/config.h"
 
 //-------------------------------------------------------------------
@@ -43,9 +51,15 @@ namespace tcmalloc_internal {
 
 static constexpr int kMaxStackDepth = 64;
 
+// An opaque handle type used to identify allocations.
+using AllocHandle = int64_t;
+
 // size/depth are made the same size as a pointer so that some generic
 // code below can conveniently cast them back and forth to void*.
 struct StackTrace {
+  // An opaque handle used by allocator to uniquely identify the sampled
+  // memory block.
+  AllocHandle sampled_alloc_handle;
 
   // For small sampled objects, we allocate a full span to hold the
   // sampled object.  However to avoid disturbing fragmentation
@@ -58,24 +72,30 @@ struct StackTrace {
 
   uintptr_t requested_size;
   uintptr_t requested_alignment;
+  bool requested_size_returning;
   uintptr_t allocated_size;  // size after sizeclass/page rounding
 
-  uintptr_t depth;           // Number of PC values stored in array below
+  uint8_t access_hint;
+  bool cold_allocated;
+
+  uintptr_t depth;  // Number of PC values stored in array below
   void* stack[kMaxStackDepth];
 
   // weight is the expected number of *bytes* that were requested
   // between the previous sample and this one
   size_t weight;
 
-  template <typename H>
-  friend H AbslHashValue(H h, const StackTrace& t) {
-    // As we use StackTrace as a key-value node in StackTraceTable, we only
-    // produce a hasher for the fields used as keys.
-    return H::combine(H::combine_contiguous(std::move(h), t.stack, t.depth),
-                      t.depth, t.requested_size, t.requested_alignment,
-                      t.allocated_size
-    );
-  }
+  // Timestamp of allocation.
+  absl::Time allocation_time;
+
+  // If not nullptr, this is the start address of the span corresponding to this
+  // sampled allocation. This may be nullptr for cases where it is not useful
+  // for residency analysis such as for peakheapz.
+  void* span_start_address = nullptr;
+
+  // An integer representing the guarded status of the allocation.
+  // The values are from the enum GuardedStatus in ../malloc_extension.h.
+  int guarded_status;
 };
 
 enum LogMode {
@@ -90,6 +110,7 @@ class LogItem {
  public:
   LogItem() : tag_(kEnd) {}
   LogItem(const char* v) : tag_(kStr) { u_.str = v; }
+  LogItem(const std::string& v) : LogItem(v.c_str()) {}
   LogItem(int v) : tag_(kSigned) { u_.snum = v; }
   LogItem(long v) : tag_(kSigned) { u_.snum = v; }
   LogItem(long long v) : tag_(kSigned) { u_.snum = v; }
@@ -112,7 +133,8 @@ class LogItem {
 
 extern void Log(LogMode mode, const char* filename, int line, LogItem a,
                 LogItem b = LogItem(), LogItem c = LogItem(),
-                LogItem d = LogItem());
+                LogItem d = LogItem(), LogItem e = LogItem(),
+                LogItem f = LogItem());
 
 enum CrashMode {
   kCrash,          // Print the message and crash
@@ -121,7 +143,8 @@ enum CrashMode {
 
 ABSL_ATTRIBUTE_NORETURN
 void Crash(CrashMode mode, const char* filename, int line, LogItem a,
-           LogItem b = LogItem(), LogItem c = LogItem(), LogItem d = LogItem());
+           LogItem b = LogItem(), LogItem c = LogItem(), LogItem d = LogItem(),
+           LogItem e = LogItem(), LogItem f = LogItem());
 
 // Tests can override this function to collect logging messages.
 extern void (*log_message_writer)(const char* msg, int length);
@@ -146,13 +169,13 @@ extern void (*log_message_writer)(const char* msg, int length);
 class Printer {
  private:
   char* buf_;     // Where should we write next
-  int left_;      // Space left in buffer (including space for \0)
-  int required_;  // Space we needed to complete all printf calls up to this
-                  // point
+  size_t left_;   // Space left in buffer (including space for \0)
+  size_t required_;  // Space we needed to complete all printf calls up to this
+                     // point
 
  public:
   // REQUIRES: "length > 0"
-  Printer(char* buf, int length) : buf_(buf), left_(length), required_(0) {
+  Printer(char* buf, size_t length) : buf_(buf), left_(length), required_(0) {
     ASSERT(length > 0);
     buf[0] = '\0';
   }
@@ -163,7 +186,7 @@ class Printer {
     if (left_ <= 0) {
       return;
     }
-
+    AllocationGuard enforce_no_alloc;
     const int r = absl::SNPrintF(buf_, left_, format, args...);
     if (r < 0) {
       left_ = 0;
@@ -179,7 +202,42 @@ class Printer {
     }
   }
 
-  int SpaceRequired() const { return required_; }
+  template <typename... Args>
+  void Append(const Args&... args) {
+    AllocationGuard enforce_no_alloc;
+    AppendPieces({static_cast<const absl::AlphaNum&>(args).Piece()...});
+  }
+
+  size_t SpaceRequired() const { return required_; }
+
+ private:
+  void AppendPieces(std::initializer_list<absl::string_view> pieces) {
+    ASSERT(left_ >= 0);
+    if (left_ <= 0) {
+      return;
+    }
+
+    size_t total_size = 0;
+    for (const absl::string_view piece : pieces) total_size += piece.size();
+
+    required_ += total_size;
+    if (left_ < total_size) {
+      left_ = 0;
+      return;
+    }
+
+    for (const absl::string_view& piece : pieces) {
+      const size_t this_size = piece.size();
+      if (this_size == 0) {
+        continue;
+      }
+
+      memcpy(buf_, piece.data(), this_size);
+      buf_ += this_size;
+    }
+
+    left_ -= total_size;
+  }
 };
 
 enum PbtxtRegionType { kTop, kNested };
@@ -189,7 +247,7 @@ enum PbtxtRegionType { kTop, kNested };
 // brackets).
 class PbtxtRegion {
  public:
-  PbtxtRegion(Printer* out, PbtxtRegionType type, int indent);
+  PbtxtRegion(Printer* out, PbtxtRegionType type);
   ~PbtxtRegion();
 
   PbtxtRegion(const PbtxtRegion&) = delete;
@@ -206,11 +264,8 @@ class PbtxtRegion {
   PbtxtRegion CreateSubRegion(absl::string_view key);
 
  private:
-  void NewLineAndIndent();
-
   Printer* out_;
   PbtxtRegionType type_;
-  int indent_;
 };
 
 }  // namespace tcmalloc_internal

@@ -41,7 +41,7 @@ MALLOC: =  12942756418 (12343.2 MiB) Virtual address space used
     the OS minus any bytes that are held in caches and other internal data
     structures.
 *   **Bytes in page heap freelist:** The pageheap is a structure that holds
-    memory ready for TCMalloc to use it. This memory is not actively being used,
+    memory ready for TCMalloc to use. This memory is not actively being used,
     and could be returned to the OS. [See TCMalloc tuning](tuning.md)
 *   **Bytes in central cache freelist:** This is the amount of memory currently
     held in the central freelist. This is a structure that holds partially used
@@ -52,26 +52,26 @@ MALLOC: =  12942756418 (12343.2 MiB) Virtual address space used
     each CPU holds some memory ready to quickly hand to the application. The
     maximum size of this per-cpu cache is tunable.
     [See TCMalloc tuning](tuning.md)
-*   **Bytes in transfer cache freelist:** The transfer cache is can be
-    considered another part of the central freelist. It holds memory that is
-    ready to be provided to the application for use.
+*   **Bytes in transfer cache freelist:** The transfer cache can be considered
+    another part of the central freelist. It holds memory that is ready to be
+    provided to the application for use.
 *   **Bytes in thread cache freelists:** The TC in TCMalloc stands for thread
     cache. Originally each thread held its own cache of memory to provide to the
-    application. Since the change of default the thread caches are used by very
-    few applications. However, TCMalloc starts in per-thread mode, so there may
-    be some memory left in per-thread caches from before it switches into
-    per-cpu mode.
+    application. Since the change of default to per-cpu caches, the thread
+    caches are used by very few applications. However, TCMalloc starts in
+    per-thread mode, so there may be some memory left in per-thread caches from
+    before it switches into per-cpu mode.
 *   **Bytes in malloc metadata:** the size of the data structures used for
     tracking memory allocation. This will grow as the amount of memory used
     grows.
 *   **Bytes in malloc metadata Arena unallocated:** Metadata is allocated in an
-    internal Arena.  Memory requests to the OS are made in blocks which amortize
+    internal Arena. Memory requests to the OS are made in blocks which amortize
     several Arena allocations and this captures memory that is not yet allocated
     but could be by future Arena allocations.
-*   **Bytes in malloc metadata Arena unavailable:** The Arena allocator may
-    fail to allocate a block fully when a subsequent Arena allocation request is
-    made that is larger than the block's remaining space.  This memory is
-    currently unavailable for allocation.
+*   **Bytes in malloc metadata Arena unavailable:** The Arena allocator may fail
+    to allocate a block fully when a subsequent Arena allocation request is made
+    that is larger than the block's remaining space. This memory is currently
+    unavailable for allocation.
 
 There's a couple of summary lines:
 
@@ -119,8 +119,33 @@ MALLOC:        4067336 (    3.9 MiB) Pagemap root resident bytes
 *   **Table buckets:** These hold data for stack traces for sampled events.
 *   **Pagemap:** This data structure supports the mapping of object addresses to
     information about the objects held on the page. The pagemap root is a
-    potentially large array, and it is useful to know how much is actually
+    potentially large array, and it is useful to know how much of it is actually
     memory resident.
+
+### Realized Fragmentation
+
+```
+MALLOC:    12238113346 (11671.2 MiB) Actual memory used at peak
+MALLOC:    11626207678 (11087.6 MiB) Estimated in-use at peak
+MALLOC:              5.2632          Realized fragmentation (%)
+```
+
+Memory overhead at peak demand is more important than off-peak, since we need to
+provision a process with sufficient memory to run during its peak requirements
+without OOM'ing. After a peak in demand, memory may be deallocated and held in
+caches in anticipation of future reuse. Overhead as a fraction of the remaining
+live allocations rises, but no additional memory is required.
+
+This metric is called "realized fragmentation" and described in ["Adaptive
+Hugepage Subrelease for Non-moving Memory Allocators in Warehouse-Scale
+Computers"](https://research.google/pubs/pub50436/) (ISMM 2021). The realized
+fragmentation metric computed here is a snapshot over the life of the entire
+process.
+
+These realized fragmentation stats in the summary table indicate a snapshot of
+conditions when TCMalloc used a peak in its physical memory. As of April 2022,
+the in-use at peak number is estimated from TCMalloc's periodic allocation
+sampling.
 
 ### Page Sizes
 
@@ -135,15 +160,15 @@ to be able to disambiguate them.
     TCMalloc. Objects on the same page are the same number of bytes in size.
     Internally TCMalloc manages memory in chunks of this size. TCMalloc supports
     4 sizes: 4KiB (small but slow), 8KiB (the default), 32 KiB (large), 256 KiB
-    (256 KiB pages). There's trade-offs around the page sizes:
+    (256 KiB pages). There are trade-offs around the page sizes:
     *   Smaller page sizes are more memory efficient because we have less
         fragmentation (ie left over space) when trying to provide the requested
         amount of memory using 4KiB chunks. It's also more likely that all the
         objects on a 4KiB page will be freed allowing the page to be returned
         and used for a different size of data.
     *   Larger pages result in fewer fetches from the page heap to provide a
-        given amount of memory. They also keep memory of the same size in closer
-        proximity.
+        given amount of memory. They also keep allocated objects of the same
+        size in closer proximity.
 *   **TCMalloc hugepage size:** This is the size of a hugepage on the system,
     for x86 this is 2MiB. This size is used as a unit of management by
     temeriare, but not used by the pre-temeraire pageheap.
@@ -190,7 +215,6 @@ sizes. There are various caches in TCMalloc where memory gets held, and the per
 size-class section reports how much memory is being used by cached objects of
 each size. The columns reported for each size-class are:
 
-*   The size
 *   The size of each object in that size-class.
 *   The number of objects of that size currently held in the per-cpu,
     per-thread, transfer, and central caches.
@@ -235,29 +259,49 @@ class   5 [       40 bytes ] :      0 < 1,     1 < 2,     1 < 4,     0 < 8,     
 ### Transfer Cache Information
 
 Transfer cache is used by TCMalloc, before going to central free list. For each
-size-class we track how often insert or remove requests have been satisfied from
-transfer cache.
+size-class, we track and report the following statistics:
+
+*   The size of each object in that size-class.
+*   The number of objects of that size currently held in the transfer cache.
+*   The total size of those objects in MiB - i.e. size of each object multiplied
+    by the number of objects in the freelist.
+*   The cumulative size of that size-class plus all smaller size-classes.
+*   The current capacity of the freelist.
+*   The maximum capacity to which the freelist is allowed to grow.
+*   The number of hits observed during inserts to the transfer cache.
+*   The total number batched and non-batched misses observed during insert
+    operations.
+*   The number of partial (i.e. non-batch-sized) misses observed during insert
+    operations.
+*   The number of hits observed during removes from the transfer cache.
+*   The total number batched and non-batched misses observed during remove
+    operations.
+*   The number of partial (i.e. non-batch-sized) misses observed during remove
+    operations.
 
 ```
-
-Transfer cache insert/remove hits/misses by size class
-class   1 [        8 bytes ] :        0 insert hits;        2 insert misses (       2 partial);        0 remove hits;        2 remove misses (       2 partial);
-class   2 [       16 bytes ] :        0 insert hits;        0 insert misses (       0 partial);        0 remove hits;        0 remove misses (       0 partial);
-class   3 [       24 bytes ] :        0 insert hits;        0 insert misses (       0 partial);        0 remove hits;        0 remove misses (       0 partial);
-class   4 [       32 bytes ] :        0 insert hits;        0 insert misses (       0 partial);        0 remove hits;        0 remove misses (       0 partial);
-class   5 [       40 bytes ] :        0 insert hits;        0 insert misses (       0 partial);        0 remove hits;        0 remove misses (       0 partial);
-class   6 [       48 bytes ] :        0 insert hits;        0 insert misses (       0 partial);        0 remove hits;        1 remove misses (       1 partial);
-class   7 [       56 bytes ] :        0 insert hits;        0 insert misses (       0 partial);        0 remove hits;        0 remove misses (       0 partial);
-class   8 [       64 bytes ] :        0 insert hits;        6 insert misses (       6 partial);        0 remove hits;        5 remove misses (       2 partial);
-class   9 [       72 bytes ] :       41 insert hits;     1133 insert misses (    1133 partial);       40 remove hits;      133 remove misses (      63 partial);
-class  10 [       80 bytes ] :      132 insert hits;      330 insert misses (     330 partial);      125 remove hits;      228 remove misses (      55 partial);
+------------------------------------------------
+Used bytes, current capacity, and maximum allowed capacity
+of the transfer cache freelists.
+It also reports insert/remove hits/misses by size class.
+------------------------------------------------
+class   1 [        8 bytes ] :     1472 objs;   0.0 MiB;    0.0 cum MiB;  2048 capacity;  2048 max_capacity;      935 insert hits;     8543 insert misses (    4507 partial);      889 remove hits;     6612 remove misses (      86 partial);
+class   2 [       16 bytes ] :      608 objs;   0.0 MiB;    0.0 cum MiB;  2048 capacity;  2048 max_capacity;      575 insert hits;     3739 insert misses (    3602 partial);      556 remove hits;     3368 remove misses (      70 partial);
+class   3 [       24 bytes ] :      864 objs;   0.0 MiB;    0.0 cum MiB;  2048 capacity;  2048 max_capacity;     1533 insert hits;    15594 insert misses (    9417 partial);     1506 remove hits;    11939 remove misses (      74 partial);
+class   4 [       32 bytes ] :       96 objs;   0.0 MiB;    0.0 cum MiB;  2048 capacity;  2048 max_capacity;     1065 insert hits;    21772 insert misses (   19918 partial);     1061 remove hits;     6403 remove misses (     119 partial);
+class   5 [       40 bytes ] :     1408 objs;   0.1 MiB;    0.1 cum MiB;  2048 capacity;  2048 max_capacity;     1475 insert hits;    16018 insert misses (   14943 partial);     1431 remove hits;     3293 remove misses (      60 partial);
+class   6 [       48 bytes ] :     1664 objs;   0.1 MiB;    0.2 cum MiB;  2048 capacity;  2048 max_capacity;     1213 insert hits;    39140 insert misses (   37096 partial);     1160 remove hits;     5909 remove misses (      80 partial);
+class   7 [       56 bytes ] :     1792 objs;   0.1 MiB;    0.3 cum MiB;  2048 capacity;  2048 max_capacity;      466 insert hits;      650 insert misses (     375 partial);      410 remove hits;     1264 remove misses (      55 partial);
+class   8 [       64 bytes ] :     1408 objs;   0.1 MiB;    0.4 cum MiB;  2048 capacity;  2048 max_capacity;     2181 insert hits;     8816 insert misses (    8069 partial);     2137 remove hits;     2024 remove misses (      74 partial);
+class   9 [       72 bytes ] :      960 objs;   0.1 MiB;    0.4 cum MiB;  1600 capacity;  2048 max_capacity;      104 insert hits;      463 insert misses (     463 partial);       74 remove hits;      287 remove misses (      62 partial);
+class  10 [       80 bytes ] :     1056 objs;   0.1 MiB;    0.5 cum MiB;  2048 capacity;  2048 max_capacity;      372 insert hits;     3334 insert misses (    3287 partial);      339 remove hits;      562 remove misses (      80 partial);
 ...
 ```
 
 As of July 2021, the `TransferCache` misses when inserting or removing a
-non-batch size number of objects from the cache.  These are reflected in the
-"partial" column.  The insert and remove miss column is *inclusive* of misses
-for both batch size and non-batch size numbers of objects.
+non-batch size number of objects from the cache. These are reflected in the
+"partial" column. The insert and remove miss column is *inclusive* of misses for
+both batch size and non-batch size numbers of objects.
 
 ### Per-CPU Information
 
@@ -266,7 +310,7 @@ being cached on each CPU.
 
 The first number reported is the maximum size of the per-cpu cache on each CPU.
 This corresponds to the parameter `MallocExtension::GetMaxPerCpuCacheSize()`,
-which defaults to 3MiB. [See tuning](tuning.md)
+which defaults to 1.5MiB. [See tuning](tuning.md)
 
 The following columns are reported for each CPU:
 
@@ -313,6 +357,67 @@ cpu   4:      1260016 bytes (    1.2 MiB) with      179800 bytes unallocated
 Some CPU caches may be marked `active`, indicating that the process is currently
 runnable on that CPU.
 
+### Size Class Capacity Information in Per-CPU Caches
+
+In per-CPU caches, TCMalloc caches objects of discrete sizes. These are referred
+to as size classes. Memory requests for a particular object size are rounded off
+to a convenient size class. TCMalloc populates objects in each size class based
+on their demand, but also imposes an upper limit on the number of objects that
+may be cached per size class. The statistics below measure the capacity of each
+size class freelist, where capacity represents the total number of objects
+currently cached by the freelist. The columns below report number of objects
+cached by TCMalloc per size class:
+
+*   Size class.
+*   The size of each object in that size class.
+*   Minimum capacity of the size class freelist summarized over all per-CPU
+    caches.
+*   Average capacity of the size class freelist summarized over all per-CPU
+    caches.
+*   Maximum capacity of the size class freelist summarized over all per-CPU
+    caches.
+*   The upper limit imposed by TCMalloc on the number of objects that can be
+    cached in a per-CPU cache for that size class.
+
+```
+------------------------------------------------
+Size class capacity statistics in per-cpu caches
+------------------------------------------------
+class   0 [        0 bytes ] :      0 (minimum),    0.0 (average),     0 (maximum),     0 maximum allowed capacity
+class   1 [        8 bytes ] :      0 (minimum),  133.1 (average),   636 (maximum),  2048 maximum allowed capacity
+class   2 [       16 bytes ] :      0 (minimum),   51.8 (average),   378 (maximum),  2048 maximum allowed capacity
+class   3 [       24 bytes ] :      0 (minimum),  119.3 (average),   510 (maximum),  2048 maximum allowed capacity
+class   4 [       32 bytes ] :      0 (minimum),  100.0 (average),   542 (maximum),  2048 maximum allowed capacity
+class   5 [       40 bytes ] :      0 (minimum),   80.6 (average),   467 (maximum),  2048 maximum allowed capacity
+```
+
+### Number of per-CPU cache underflows, overflows, and reclaims
+
+We also keep track of cache miss counts. Underflows are when the user allocates
+and the cache does not have any pointers to return. Overflows are when the user
+deallocates and the cache is full. The ratio of overflows to underflows gives a
+rough indication of whether the cache is large enough. If the cache had infinite
+capacity, then we would expect to have 0 overflows whereas if the cache had 0
+capacity, we would expect to see roughly equal numbers of overflows and
+underflows. Therefore, if the ratio is close to 1.0, then the cache may not be
+large enough. Reclaims are when we empty out a cache for a specific CPU because
+it has been idle for a period of time. In this section, we report the total
+numbers of each of these metrics across all CPUs as well as the numbers for each
+individual CPU.
+
+```
+------------------------------------------------
+Number of per-CPU cache underflows, overflows, and reclaims
+------------------------------------------------
+Total  :         242 underflows,          12 overflows, overflows / underflows:  0.05,          168 reclaims
+cpu   0:          69 underflows,           5 overflows, overflows / underflows:  0.07,           46 reclaims
+cpu   1:          58 underflows,           0 overflows, overflows / underflows:  0.00,           42 reclaims
+cpu   2:          62 underflows,           7 overflows, overflows / underflows:  0.11,           42 reclaims
+cpu   3:          40 underflows,           0 overflows, overflows / underflows:  0.00,           27 reclaims
+cpu   4:          13 underflows,           0 overflows, overflows / underflows:  0.00,           11 reclaims
+cpu   5:           0 underflows,           0 overflows, overflows / underflows:  0.00,            0 reclaims
+```
+
 ### Pageheap Information
 
 The pageheap holds pages of memory that are not currently being used either by
@@ -326,7 +431,7 @@ caches, or to directly satisfy requests that are larger than the sizes supported
 by the per-thread or per-cpu caches.
 
 **Note:** TCMalloc cannot tell whether a span of memory is actually backed by
-physical memory, but it uses _unmapped_ to indicate that it has told the OS that
+physical memory, but it uses *unmapped* to indicate that it has told the OS that
 the span is not used and does not need the associated physical memory. For this
 reason the physical memory of an application may be larger that the amount that
 TCMalloc reports.
@@ -507,8 +612,9 @@ of continuous pages:
 ### Per Component Information
 
 The Huge Page Aware Allocator has multiple places where pages of memory are
-held. More details of its workings can be found in this document. There are four
-caches where pages of memory can be located:
+held. More details of its workings can be found in
+[the Temeraire design doc](temeraire.md). There are four caches where pages of
+memory can be located:
 
 *   The filler, used for allocating ranges of a few TCMalloc pages in size.
 *   The region cache, used for allocating ranges of multiple pages.
@@ -673,10 +779,8 @@ which is an indication of how much memory could have been "usefully" reclaimed
 (i.e., free for long enough that the OS would likely be able to use the memory
 for another process). The line shows both the total number of free pages in the
 filler (whether or not released to the OS) as well as only those that were
-backed by physical memory for the full 5-min interval. This metric is called
-"realized fragmentation" and described in ["Adaptive Hugepage Subrelease for
-Non-moving Memory Allocators in Warehouse-Scale
-Computers"](https://research.google/pubs/pub50436/) (ISMM 2021).
+backed by physical memory for the full 5-min interval. The realized
+fragmentation metric computed here uses a bounded window.
 
 The next two sections show the state of the filler at peak demand (i.e., when
 the maximum number of pages was in use) and at peak hps (i.e., when the maximum
@@ -686,21 +790,35 @@ hugepages active at that time. If there are multiple peaks, we return the state
 at the latest one of them.
 
 If applicable, an additional section tracks the behavior that skips subreleasing
-hugepages if behind a recent peak (`--tcmalloc_skip_subrelease_interval`):
+hugepages if behind the recent demand requirement, which is either the peak
+within `--tcmalloc_skip_subrelease_interval`, or the sum of short-term
+fluctuation peak within `--tcmalloc_skip_subrelease_short_interval` and
+long-term trend within `--tcmalloc_skip_subrelease_long_interval`.
+
+**Note:** Conducting skip-subrelease using both short-term and long-term
+intervals is an experimental feature, and should not be enabled without
+understanding its performance tradeoffs.
 
 ```
-HugePageFiller: Since the start of the execution, 0 subreleases (0 pages) were skipped due to recent (0s) peaks.
-HugePageFiller: 100.0000% of decisions confirmed correct, 0 pending (100.0000% of pages, 0 pending).
+HugePageFiller: Since the start of the execution, 0 subreleases (0 pages) were skipped due to either recent (0s) peaks, or the sum of short-term (0s) fluctuations and long-term (0s) trends..
+HugePageFiller: 100.0000% of decisions confirmed correct, 0 pending (100.0000% of pages, 0 pending), as per anticipated 300s realized fragmentation.
 ```
 
 This shows how many times a page that was meant to be subreleased was not (note
 that this can refer to the same page multiple times if subrelease of this page
 would have been triggered multiple times). The percentage shows what fraction of
 times this decision would have been correct (i.e., if we decided not to
-subrelease a page because of a peak within the last N minutes, did memory
-consumption increase again within the *next* N minutes?). "Pending" refers to
-subrelease decisions that were less than N minutes in the past and we therefore
-do not know yet whether or not they were correct.
+subrelease a page because of the calculated demand requirement, did memory
+consumption increase again within the *next* five minutes?). "Pending" refers to
+subrelease decisions that were less than five minutes in the past and we
+therefore do not know yet whether or not they were correct. The correctness
+evaluation chooses to use the five minutes interval as it is the interval used
+for realized fragmentation.
+
+The skip-subrelease feature prioritizes using the recent peak if
+`--tcmalloc_skip_subrelease_interval` is configured, otherwise it uses the
+combination of the recent short-term fluctuation peak and long-term trend. The
+feature is disabled if all three intervals are zero.
 
 ### Region Cache
 

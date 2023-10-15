@@ -16,24 +16,22 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
 #include <sched.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
 
-#include <array>
 #include <cstring>
+#include <optional>
 
 #include "absl/base/attributes.h"
-#include "absl/base/internal/sysinfo.h"
 #include "absl/functional/function_ref.h"
-#include "absl/strings/numbers.h"
-#include "absl/strings/string_view.h"
 #include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/environment.h"
 #include "tcmalloc/internal/logging.h"
+#include "tcmalloc/internal/percpu.h"
+#include "tcmalloc/internal/sysinfo.h"
 #include "tcmalloc/internal/util.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
@@ -52,62 +50,9 @@ int OpenSysfsCpulist(size_t node) {
   return signal_safe_open(path, O_RDONLY | O_CLOEXEC);
 }
 
-cpu_set_t ParseCpulist(absl::FunctionRef<ssize_t(char *, size_t)> read) {
-  cpu_set_t set;
-  CPU_ZERO(&set);
-
-  std::array<char, 16> buf;
-  size_t carry_over = 0;
-  int cpu_from = -1;
-
-  while (true) {
-    const ssize_t rc = read(buf.data() + carry_over, buf.size() - carry_over);
-    CHECK_CONDITION(rc >= 0);
-
-    const absl::string_view current(buf.data(), carry_over + rc);
-
-    // If we have no more data to parse & couldn't read any then we've reached
-    // the end of the input & are done.
-    if (current.empty() && rc == 0) {
-      break;
-    }
-
-    size_t consumed;
-    const size_t dash = current.find('-');
-    const size_t comma = current.find(',');
-    if (dash != absl::string_view::npos && dash < comma) {
-      CHECK_CONDITION(absl::SimpleAtoi(current.substr(0, dash), &cpu_from));
-      consumed = dash + 1;
-    } else if (comma != absl::string_view::npos || rc == 0) {
-      int cpu;
-      CHECK_CONDITION(absl::SimpleAtoi(current.substr(0, comma), &cpu));
-      if (comma == absl::string_view::npos) {
-        consumed = current.size();
-      } else {
-        consumed = comma + 1;
-      }
-      if (cpu_from != -1) {
-        for (int c = cpu_from; c <= cpu; c++) {
-          CPU_SET(c, &set);
-        }
-        cpu_from = -1;
-      } else {
-        CPU_SET(cpu, &set);
-      }
-    } else {
-      consumed = 0;
-    }
-
-    carry_over = current.size() - consumed;
-    memmove(buf.data(), buf.data() + consumed, carry_over);
-  }
-
-  return set;
-}
-
 bool InitNumaTopology(size_t cpu_to_scaled_partition[CPU_SETSIZE],
-                      uint64_t *const partition_to_nodes,
-                      NumaBindMode *const bind_mode,
+                      uint64_t* const partition_to_nodes,
+                      NumaBindMode* const bind_mode,
                       const size_t num_partitions, const size_t scale_by,
                       absl::FunctionRef<int(size_t)> open_node_cpulist) {
   // Node 0 will always map to partition 0; record it here in case the system
@@ -133,7 +78,7 @@ bool InitNumaTopology(size_t cpu_to_scaled_partition[CPU_SETSIZE],
   // cpu_to_scaled_partition & partition_to_nodes arrays are zero initialized
   // we're trivially done - CPUs all map to partition 0, which contains only
   // CPU 0 added above.
-  const char *e =
+  const char* e =
       tcmalloc::tcmalloc_internal::thread_safe_getenv("TCMALLOC_NUMA_AWARE");
   if (e == nullptr) {
     // Enable NUMA awareness iff default_want_numa_aware().
@@ -159,7 +104,7 @@ bool InitNumaTopology(size_t cpu_to_scaled_partition[CPU_SETSIZE],
   // allocated prior to lookups. It has CPU_SETSIZE entries which ought to be
   // sufficient, but sanity check that indexing it by CPU number shouldn't
   // exceed its bounds.
-  int num_cpus = absl::base_internal::NumCPUs();
+  int num_cpus = NumCPUs();
   CHECK_CONDITION(num_cpus <= CPU_SETSIZE);
 
   // We could just always report that we're NUMA aware, but if a NUMA-aware
@@ -191,21 +136,25 @@ bool InitNumaTopology(size_t cpu_to_scaled_partition[CPU_SETSIZE],
     }
 
     // Parse the cpulist file to determine which CPUs are local to this node.
-    const cpu_set_t node_cpus =
-        ParseCpulist([&](char *const buf, const size_t count) {
+    const std::optional<cpu_set_t> node_cpus =
+        ParseCpulist([&](char* const buf, const size_t count) {
           return signal_safe_read(fd, buf, count, /*bytes_read=*/nullptr);
         });
+    // We are on the same side of an airtight hatchway as the kernel, but we
+    // want to know if we can no longer parse the values the kernel is
+    // providing.
+    CHECK_CONDITION(node_cpus.has_value());
 
     // Assign local CPUs to the appropriate partition.
     for (size_t cpu = 0; cpu < CPU_SETSIZE; cpu++) {
-      if (CPU_ISSET(cpu, &node_cpus)) {
+      if (CPU_ISSET(cpu, &*node_cpus)) {
         cpu_to_scaled_partition[cpu + kNumaCpuFudge] = partition * scale_by;
       }
     }
 
     // If we observed any CPUs for this node then we've now got CPUs assigned
     // to a non-zero partition; report that we're NUMA aware.
-    if (CPU_COUNT(&node_cpus) != 0) {
+    if (CPU_COUNT(&*node_cpus) != 0) {
       numa_aware = true;
     }
 

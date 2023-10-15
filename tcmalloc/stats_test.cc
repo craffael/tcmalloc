@@ -14,6 +14,9 @@
 
 #include "tcmalloc/stats.h"
 
+#include <stddef.h>
+#include <stdint.h>
+
 #include <limits>
 #include <string>
 
@@ -22,6 +25,7 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "tcmalloc/huge_pages.h"
+#include "tcmalloc/internal/logging.h"
 
 namespace tcmalloc {
 namespace tcmalloc_internal {
@@ -32,8 +36,8 @@ class PrintTest : public ::testing::Test {
   static constexpr size_t kBufferSize = 256 * 1024;
   char buf_[kBufferSize];
 
-  void ExpectStats(const BackingStats &back, const SmallSpanStats &small,
-                   const LargeSpanStats &large, const std::string &expected) {
+  void ExpectStats(const BackingStats& back, const SmallSpanStats& small,
+                   const LargeSpanStats& large, const std::string& expected) {
     Printer out(&buf_[0], kBufferSize);
     PrintStats("PrintTest", &out, back, small, large, true);
     EXPECT_EQ(expected, buf_);
@@ -93,7 +97,7 @@ class AgeTest : public testing::Test {
     return kNow - freq * age;
   }
 
-  void ExpectAges(const PageAgeHistograms &ages, const std::string &expected) {
+  void ExpectAges(const PageAgeHistograms& ages, const std::string& expected) {
     Printer out(&buf_[0], kBufferSize);
     ages.Print("AgeTest", &out);
     std::string got = buf_;
@@ -120,14 +124,14 @@ TEST_F(AgeTest, Basic) {
 R"LIT(------------------------------------------------
 AgeTest cache entry age (count of pages in spans of a given size that have been idle for up to the given period of time)
 ------------------------------------------------
-                                 mean     <1s      1s     30s      1m     30m      1h     8+h
+                                 mean     <1s    <30s     <1m    <30m     <1h     <8h    >=8h
 Live span       TOTAL PAGES:  18000.9       1       2       0       0       0       0       3
 Live span,          1 pages:      1.8       1       2       0       0       0       0       0
 Live span,          3 pages:  36000.0       0       0       0       0       0       0       3
 
 Unmapped span   TOTAL PAGES:    546.0      20       0       0     202       0       0       0
 Unmapped span,      2 pages:     55.1      20       0       0       2       0       0       0
-Unmapped span,   >=64 pages:    600.0       0       0       0     200       0       0       0
+Unmapped span,  >=128 pages:    600.0       0       0       0     200       0       0       0
 )LIT";
   // clang-format on
   ExpectAges(ages, kExpected);
@@ -144,9 +148,9 @@ TEST_F(AgeTest, Overflow) {
 R"LIT(------------------------------------------------
 AgeTest cache entry age (count of pages in spans of a given size that have been idle for up to the given period of time)
 ------------------------------------------------
-                                 mean     <1s      1s     30s      1m     30m      1h     8+h
+                                 mean     <1s    <30s     <1m    <30m     <1h     <8h    >=8h
 Live span       TOTAL PAGES:      0.5 4294967295       0       0       0       0       0       0
-Live span,       >=64 pages:      0.5 4294967295       0       0       0       0       0       0
+Live span,      >=128 pages:      0.5 4294967295       0       0       0       0       0       0
 
 Unmapped span   TOTAL PAGES:      0.0       0       0       0       0       0       0       0
 )LIT";
@@ -180,7 +184,7 @@ TEST_F(AgeTest, ManySizes) {
 }
 
 TEST(PageAllocInfo, Small) {
-  PageAllocInfo info("", -1);
+  PageAllocInfo info("");
   static_assert(kMaxPages >= Length(4), "odd config");
 
   info.RecordAlloc(PageId{0}, Length(2));
@@ -209,7 +213,7 @@ TEST(PageAllocInfo, Small) {
 }
 
 TEST(PageAllocInfo, Large) {
-  PageAllocInfo info("", -1);
+  PageAllocInfo info("");
   static_assert(kPagesPerHugePage > kMaxPages, "odd config");
 
   // These three should be aggregated

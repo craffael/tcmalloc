@@ -15,6 +15,7 @@
 
 #include <fcntl.h>
 #include <sched.h>
+#include <stdint.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -22,13 +23,18 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
+#include <cstddef>
+#include <limits>
 
 #include "absl/base/attributes.h"
 #include "absl/base/call_once.h"  // IWYU pragma: keep
-#include "absl/base/internal/sysinfo.h"
+#include "absl/base/optimization.h"
+#include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/linux_syscall_support.h"
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/internal/optimization.h"
+#include "tcmalloc/internal/sysinfo.h"
 #include "tcmalloc/internal/util.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
@@ -43,37 +49,6 @@ namespace percpu {
 
 // Restartable Sequence (RSEQ)
 
-extern "C" {
-// We provide a per-thread value (defined in percpu_.c) which both tracks
-// thread-local initialization state and (with RSEQ) provides an atomic
-// in-memory reference for this thread's execution CPU.  This value is only
-// valid when the thread is currently executing
-// Possible values:
-//   Unavailable/uninitialized:
-//     { kCpuIdUnsupported, kCpuIdUninitialized }
-//   Initialized, available:
-//     [0, NumCpus())    (Always updated at context-switch)
-ABSL_PER_THREAD_TLS_KEYWORD ABSL_ATTRIBUTE_WEAK volatile kernel_rseq
-    __rseq_abi = {
-        0,      static_cast<unsigned>(kCpuIdUninitialized),   0, 0,
-        {0, 0}, {{kCpuIdUninitialized, kCpuIdUninitialized}},
-};
-
-#ifdef __ppc__
-// On PPC, we have two cases for accessing the __rseq_abi TLS variable:
-// * For initial-exec TLS, we write the raw assembly for accessing the memory
-//   with the appropriate relocations and offsets.  On optimized builds, this is
-//   the use case that matters.
-// * For non-initial-exec TLS, access is far more involved.  We call this helper
-//   function from percpu_rseq_ppc.S to leave the initialization and access to
-//   the compiler.
-ABSL_ATTRIBUTE_UNUSED ABSL_ATTRIBUTE_NOINLINE void* tcmalloc_tls_fetch_pic() {
-  return const_cast<kernel_rseq*>(&__rseq_abi);
-}
-#endif
-
-}  // extern "C"
-
 enum PerCpuInitStatus {
   kFastMode,
   kSlowMode,
@@ -81,9 +56,12 @@ enum PerCpuInitStatus {
 
 ABSL_CONST_INIT static PerCpuInitStatus init_status = kSlowMode;
 ABSL_CONST_INIT static absl::once_flag init_per_cpu_once;
-#if TCMALLOC_PERCPU_USE_RSEQ
+#if TCMALLOC_INTERNAL_PERCPU_USE_RSEQ
 ABSL_CONST_INIT static std::atomic<bool> using_upstream_fence{false};
-#endif  // TCMALLOC_PERCPU_USE_RSEQ
+#endif  // TCMALLOC_INTERNAL_PERCPU_USE_RSEQ
+
+extern "C" thread_local char tcmalloc_sampler ABSL_ATTRIBUTE_INITIAL_EXEC;
+extern "C" thread_local char tcmalloc_sampler_alias ABSL_ATTRIBUTE_INITIAL_EXEC;
 
 // Is this thread's __rseq_abi struct currently registered with the kernel?
 static bool ThreadRegistered() { return RseqCpuId() >= kCpuIdInitialized; }
@@ -94,7 +72,7 @@ static bool InitThreadPerCpu() {
     return true;
   }
 
-#ifdef __NR_rseq
+#if TCMALLOC_INTERNAL_PERCPU_USE_RSEQ && defined(__NR_rseq)
   return 0 == syscall(__NR_rseq, &__rseq_abi, sizeof(__rseq_abi), 0,
                       TCMALLOC_PERCPU_RSEQ_SIGNATURE);
 #endif  // __NR_rseq
@@ -106,22 +84,45 @@ bool UsingFlatVirtualCpus() {
 }
 
 static void InitPerCpu() {
-  CHECK_CONDITION(absl::base_internal::NumCPUs() <=
-                  std::numeric_limits<uint16_t>::max());
+  CHECK_CONDITION(NumCPUs() <= std::numeric_limits<uint16_t>::max());
 
   // Based on the results of successfully initializing the first thread, mark
   // init_status to initialize all subsequent threads.
   if (InitThreadPerCpu()) {
     init_status = kFastMode;
 
-#if TCMALLOC_PERCPU_USE_RSEQ
+#if TCMALLOC_INTERNAL_PERCPU_USE_RSEQ
+    // See the comment about data layout in percpu.h for details.
+    auto sampler_addr = reinterpret_cast<uintptr_t>(&tcmalloc_sampler);
+    auto sampler_alias_addr =
+        reinterpret_cast<uintptr_t>(&tcmalloc_sampler_alias);
+    // Have to use volatile because C++ compiler rejects to believe that
+    // objects can overlap.
+    volatile auto slabs_addr = reinterpret_cast<uintptr_t>(&tcmalloc_slabs);
+    auto rseq_abi_addr = reinterpret_cast<uintptr_t>(&__rseq_abi);
+    //  Ensure __rseq_abi alignment required by ABI.
+    CHECK_CONDITION(rseq_abi_addr % 32 == 0);
+    // Ensure that all our TLS data is in a single cache line.
+    CHECK_CONDITION((rseq_abi_addr / 64) == (slabs_addr / 64));
+    CHECK_CONDITION((rseq_abi_addr / 64) ==
+                    ((sampler_addr + TCMALLOC_SAMPLER_HOT_OFFSET) / 64));
+    // Ensure that tcmalloc_slabs partially overlap with
+    // __rseq_abi.cpu_id_start as we expect.
+    CHECK_CONDITION(slabs_addr == rseq_abi_addr + TCMALLOC_RSEQ_SLABS_OFFSET);
+    // Ensure Sampler is properly aligned.
+    CHECK_CONDITION((sampler_addr % TCMALLOC_SAMPLER_ALIGN) == 0);
+    // Ensure that tcmalloc_sampler is located before tcmalloc_slabs.
+    CHECK_CONDITION(sampler_addr + TCMALLOC_SAMPLER_SIZE <= slabs_addr);
+    // Ensure that sampler alias is actually an alias.
+    CHECK_CONDITION(sampler_addr == sampler_alias_addr);
+
     constexpr int kMEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ = (1 << 8);
     // It is safe to make the syscall below multiple times.
     using_upstream_fence.store(
-            0 == syscall(__NR_membarrier,
-                         kMEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ, 0, 0),
+        0 == syscall(__NR_membarrier,
+                     kMEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ, 0, 0),
         std::memory_order_relaxed);
-#endif  // TCMALLOC_PERCPU_USE_RSEQ
+#endif  // TCMALLOC_INTERNAL_PERCPU_USE_RSEQ
   }
 }
 
@@ -138,12 +139,14 @@ bool InitFastPerCpu() {
     CHECK_CONDITION(InitThreadPerCpu());
   }
 
+#if TCMALLOC_INTERNAL_PERCPU_USE_RSEQ
   // If we've decided to use slow mode, set the thread-local CPU ID to
   // __rseq_abi.cpu_id so that IsFast doesn't call this function again for
   // this thread.
   if (init_status == kSlowMode) {
     __rseq_abi.cpu_id = kCpuIdUnsupported;
   }
+#endif
 
   return init_status == kFastMode;
 }
@@ -163,14 +166,13 @@ static bool SetAffinityOneCpu(int cpu) {
   return false;
 }
 
-// We're being asked to fence against the mask <cpus>, but a NULL mask
+// We're being asked to fence against the mask <target>, but a -1 mask
 // means every CPU.  Do we need <cpu>?
-static bool NeedCpu(int cpu, const cpu_set_t* cpus) {
-  if (cpus == nullptr) return true;
-  return CPU_ISSET(cpu, cpus);
+static bool NeedCpu(const int cpu, const int target) {
+  return target == -1 || target == cpu;
 }
 
-static void SlowFence(const cpu_set_t* cpus) {
+static void SlowFence(int target) {
   // Necessary, so the point in time mentioned below has visibility
   // of our writes.
   std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -189,8 +191,8 @@ static void SlowFence(const cpu_set_t* cpus) {
   // side, if we are unable to run on a particular CPU, the same is true for our
   // siblings (up to some races, dealt with below), so we don't need to.
 
-  for (int cpu = 0; cpu < absl::base_internal::NumCPUs(); ++cpu) {
-    if (!NeedCpu(cpu, cpus)) {
+  for (int cpu = 0, n = NumCPUs(); cpu < n; ++cpu) {
+    if (!NeedCpu(cpu, target)) {
       // unnecessary -- user doesn't care about synchronization on this cpu
       continue;
     }
@@ -255,14 +257,14 @@ static void SlowFence(const cpu_set_t* cpus) {
     // everything in cpuset.cpus, so do that.
     cpu_set_t set;
     CPU_ZERO(&set);
-    for (int i = 0; i < absl::base_internal::NumCPUs(); ++i) {
+    for (int i = 0, n = NumCPUs(); i < n; ++i) {
       CPU_SET(i, &set);
     }
     CHECK_CONDITION(0 == sched_setaffinity(0, sizeof(cpu_set_t), &set));
   }
 }
 
-#if TCMALLOC_PERCPU_USE_RSEQ
+#if TCMALLOC_INTERNAL_PERCPU_USE_RSEQ
 static void UpstreamRseqFenceCpu(int cpu) {
   ABSL_RAW_CHECK(using_upstream_fence.load(std::memory_order_relaxed),
                  "upstream fence unavailable.");
@@ -276,33 +278,17 @@ static void UpstreamRseqFenceCpu(int cpu) {
   ABSL_RAW_CHECK(res == 0 || res == -ENXIO /* missing CPU */,
                  "Upstream fence failed.");
 }
-#endif  // TCMALLOC_PERCPU_USE_RSEQ
+#endif  // TCMALLOC_INTERNAL_PERCPU_USE_RSEQ
 
-// Interrupt every concurrently running sibling thread on any cpu in
-// "cpus", and guarantee our writes up til now are visible to every
-// other CPU. (cpus == NULL is equivalent to all CPUs.)
-static void FenceInterruptCPUs(const cpu_set_t* cpus) {
+// Interrupt every concurrently running sibling thread on "cpu", and guarantee
+// our writes up til now are visible to every other CPU. (cpu == -1 is
+// equivalent to all CPUs.)
+static void FenceInterruptCPU(int cpu) {
   CHECK_CONDITION(IsFast());
 
   // TODO(b/149390298):  Provide an upstream extension for sys_membarrier to
   // interrupt ongoing restartable sequences.
-  SlowFence(cpus);
-}
-
-void Fence() {
-  CompilerBarrier();
-
-  // Other operations (or all in RSEQ mode) might just be running on another
-  // CPU.  Do something about that: use RSEQ::Fence() to just send interrupts
-  // and restart any such operation.
-#if TCMALLOC_PERCPU_USE_RSEQ
-  if (using_upstream_fence.load(std::memory_order_relaxed)) {
-    UpstreamRseqFenceCpu(-1);
-    return;
-  }
-#endif  // TCMALLOC_PERCPU_USE_RSEQ
-
-  FenceInterruptCPUs(nullptr);
+  SlowFence(cpu);
 }
 
 void FenceCpu(int cpu, const size_t virtual_cpu_id_offset) {
@@ -313,7 +299,8 @@ void FenceCpu(int cpu, const size_t virtual_cpu_id_offset) {
 
   // A useful fast path: nothing needs doing at all to order us with respect
   // to our own CPU.
-  if (GetCurrentVirtualCpu(virtual_cpu_id_offset) == cpu) {
+  if (ABSL_PREDICT_TRUE(IsFastNoInit()) &&
+      GetCurrentVirtualCpu(virtual_cpu_id_offset) == cpu) {
     return;
   }
 
@@ -322,27 +309,28 @@ void FenceCpu(int cpu, const size_t virtual_cpu_id_offset) {
 
     // With virtual CPUs, we cannot identify the true physical core we need to
     // interrupt.
-#if TCMALLOC_PERCPU_USE_RSEQ
-    if (using_upstream_fence.load(std::memory_order_relaxed)) {
-      UpstreamRseqFenceCpu(-1);
-      return;
-    }
-#endif  // TCMALLOC_PERCPU_USE_RSEQ
-    FenceInterruptCPUs(nullptr);
+    FenceAllCpus();
     return;
   }
 
-#if TCMALLOC_PERCPU_USE_RSEQ
+#if TCMALLOC_INTERNAL_PERCPU_USE_RSEQ
   if (using_upstream_fence.load(std::memory_order_relaxed)) {
     UpstreamRseqFenceCpu(cpu);
     return;
   }
-#endif  // TCMALLOC_PERCPU_USE_RSEQ
+#endif  // TCMALLOC_INTERNAL_PERCPU_USE_RSEQ
 
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  CPU_SET(cpu, &set);
-  FenceInterruptCPUs(&set);
+  FenceInterruptCPU(cpu);
+}
+
+void FenceAllCpus() {
+#if TCMALLOC_INTERNAL_PERCPU_USE_RSEQ
+  if (using_upstream_fence.load(std::memory_order_relaxed)) {
+    UpstreamRseqFenceCpu(-1);
+    return;
+  }
+#endif  // TCMALLOC_INTERNAL_PERCPU_USE_RSEQ
+  FenceInterruptCPU(-1);
 }
 
 }  // namespace percpu

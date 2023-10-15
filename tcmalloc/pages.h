@@ -132,6 +132,11 @@ class PageId {
     return *this;
   }
 
+  template <typename H>
+  friend H AbslHashValue(H h, const PageId& p) {
+    return H::combine(std::move(h), p.pn_);
+  }
+
  private:
   friend constexpr bool operator<(PageId lhs, PageId rhs);
   friend constexpr bool operator>(PageId lhs, PageId rhs);
@@ -255,40 +260,30 @@ inline Length& operator++(Length& l) { return l += Length(1); }
 inline Length& operator--(Length& l) { return l -= Length(1); }
 
 TCMALLOC_ATTRIBUTE_CONST
-inline constexpr Length operator+(Length lhs, Length rhs) {
-  return Length(lhs.raw_num() + rhs.raw_num());
-}
+inline constexpr Length operator+(Length lhs, Length rhs) { return lhs += rhs; }
 
 TCMALLOC_ATTRIBUTE_CONST
-inline constexpr Length operator-(Length lhs, Length rhs) {
-  return Length(lhs.raw_num() - rhs.raw_num());
-}
+inline constexpr Length operator-(Length lhs, Length rhs) { return lhs -= rhs; }
 
 TCMALLOC_ATTRIBUTE_CONST
-inline constexpr Length operator*(Length lhs, size_t rhs) {
-  return Length(lhs.raw_num() * rhs);
-}
+inline constexpr Length operator*(Length lhs, size_t rhs) { return lhs *= rhs; }
 
 TCMALLOC_ATTRIBUTE_CONST
-inline constexpr Length operator*(size_t lhs, Length rhs) {
-  return Length(lhs * rhs.raw_num());
-}
+inline constexpr Length operator*(size_t lhs, Length rhs) { return rhs *= lhs; }
 
 TCMALLOC_ATTRIBUTE_CONST
 inline constexpr size_t operator/(Length lhs, Length rhs) {
+  ASSERT(rhs.raw_num() != 0);
   return lhs.raw_num() / rhs.raw_num();
 }
 
 TCMALLOC_ATTRIBUTE_CONST
-inline constexpr Length operator/(Length lhs, size_t rhs) {
-  ASSERT(rhs != 0);
-  return Length(lhs.raw_num() / rhs);
-}
+inline constexpr Length operator/(Length lhs, size_t rhs) { return lhs /= rhs; }
 
 TCMALLOC_ATTRIBUTE_CONST
 inline constexpr Length operator%(Length lhs, Length rhs) {
   ASSERT(rhs.raw_num() != 0);
-  return Length(lhs.raw_num() % rhs.raw_num());
+  return lhs %= rhs;
 }
 
 }  // namespace tcmalloc_internal

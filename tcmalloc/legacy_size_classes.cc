@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tcmalloc/common.h"
+#include "tcmalloc/sizemap.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
 namespace tcmalloc {
@@ -37,9 +38,8 @@ namespace tcmalloc_internal {
 #if TCMALLOC_PAGE_SHIFT == 13
 static_assert(kMaxSize == 262144, "kMaxSize mismatch");
 static const int kCount = 86;
-static_assert(kCount <= kNumClasses);
-const int SizeMap::kLegacySizeClassesCount = kCount;
-const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount] = {
+static_assert(kCount <= kNumBaseClasses);
+static constexpr SizeClassInfo kLegacySizeClassesList[kCount] = {
     // <bytes>, <pages>, <batch size>    <fixed>
     {        0,       0,           0},  // +Inf%
     {        8,       1,          32},  // 0.59%
@@ -60,6 +60,7 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {      128,       1,          32},  // 0.59%
     {      136,       1,          32},  // 0.98%
     {      144,       1,          32},  // 2.18%
+    {      152,       1,          32},  // 2.28%
     {      160,       1,          32},  // 0.98%
     {      176,       1,          32},  // 1.78%
     {      192,       1,          32},  // 2.18%
@@ -68,11 +69,11 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {      240,       1,          32},  // 0.98%
     {      256,       1,          32},  // 0.59%
     {      272,       1,          32},  // 0.98%
-    {      296,       1,          32},  // 3.10%
+    {      288,       1,          32},  // 2.18%
     {      312,       1,          32},  // 1.58%
     {      336,       1,          32},  // 2.18%
     {      352,       1,          32},  // 1.78%
-    {      368,       1,          32},  // 1.78%
+    {      384,       1,          32},  // 2.18%
     {      408,       1,          32},  // 0.98%
     {      448,       1,          32},  // 2.18%
     {      480,       1,          32},  // 0.98%
@@ -95,13 +96,12 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {     3200,       2,          20},  // 2.70%
     {     3456,       3,          18},  // 1.79%
     {     3584,       4,          18},  // 1.74%
-    {     4096,       2,          16},  // 0.29%
+    {     4096,       1,          16},  // 0.59%
     {     4736,       3,          13},  // 3.99%
     {     5376,       2,          12},  // 1.88%
     {     6144,       3,          10},  // 0.20%
-    {     6528,       4,          10},  // 0.54%
     {     7168,       7,           9},  // 0.08%
-    {     8192,       2,           8},  // 0.29%
+    {     8192,       1,           8},  // 0.59%
     {     9472,       5,           6},  // 8.23%
     {    10240,       4,           6},  // 6.82%
     {    12288,       3,           5},  // 0.20%
@@ -121,19 +121,19 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {    98304,      12,           2},  // 0.05%
     {   114688,      14,           2},  // 0.04%
     {   131072,      16,           2},  // 0.04%
-    {   147456,      18,           2},  // 0.03%
-    {   163840,      20,           2},  // 0.03%
-    {   180224,      22,           2},  // 0.03%
+    {   139264,      17,           2},  // 0.03%
+    {   155648,      19,           2},  // 0.03%
+    {   172032,      21,           2},  // 0.03%
     {   204800,      25,           2},  // 0.02%
     {   237568,      29,           2},  // 0.02%
     {   262144,      32,           2},  // 0.02%
 };
+constexpr absl::Span<const SizeClassInfo> kLegacySizeClasses(kLegacySizeClassesList);
 #elif TCMALLOC_PAGE_SHIFT == 15
 static_assert(kMaxSize == 262144, "kMaxSize mismatch");
 static const int kCount = 78;
-static_assert(kCount <= kNumClasses);
-const int SizeMap::kLegacySizeClassesCount = kCount;
-const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount] = {
+static_assert(kCount <= kNumBaseClasses);
+static constexpr SizeClassInfo kLegacySizeClassesList[kCount] = {
     // <bytes>, <pages>, <batch size>    <fixed>
     {        0,       0,           0},  // +Inf%
     {        8,       1,          32},  // 0.15%
@@ -150,23 +150,22 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {       96,       1,          32},  // 0.24%
     {      104,       1,          32},  // 0.17%
     {      112,       1,          32},  // 0.34%
+    {      120,       1,          32},  // 0.17%
     {      128,       1,          32},  // 0.15%
     {      144,       1,          32},  // 0.39%
     {      160,       1,          32},  // 0.54%
     {      176,       1,          32},  // 0.24%
     {      192,       1,          32},  // 0.54%
     {      208,       1,          32},  // 0.49%
-    {      224,       1,          32},  // 0.34%
-    {      240,       1,          32},  // 0.54%
+    {      232,       1,          32},  // 0.32%
     {      256,       1,          32},  // 0.15%
-    {      280,       1,          32},  // 0.17%
-    {      304,       1,          32},  // 0.89%
-    {      328,       1,          32},  // 1.06%
+    {      272,       1,          32},  // 0.54%
+    {      296,       1,          32},  // 0.79%
+    {      320,       1,          32},  // 0.54%
     {      352,       1,          32},  // 0.24%
-    {      384,       1,          32},  // 0.54%
-    {      416,       1,          32},  // 1.13%
+    {      400,       1,          32},  // 1.28%
     {      448,       1,          32},  // 0.34%
-    {      488,       1,          32},  // 0.37%
+    {      480,       1,          32},  // 0.54%
     {      512,       1,          32},  // 0.15%
     {      576,       1,          32},  // 1.74%
     {      640,       1,          32},  // 0.54%
@@ -176,13 +175,13 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {     1024,       1,          32},  // 0.15%
     {     1152,       1,          32},  // 1.74%
     {     1280,       1,          32},  // 2.55%
+    {     1408,       1,          32},  // 1.33%
     {     1536,       1,          32},  // 1.74%
-    {     1792,       1,          32},  // 1.74%
+    {     1920,       1,          32},  // 0.54%
     {     2048,       1,          32},  // 0.15%
     {     2176,       1,          30},  // 0.54%
-    {     2304,       1,          28},  // 1.74%
+    {     2432,       1,          26},  // 3.80%
     {     2688,       1,          24},  // 1.74%
-    {     2944,       1,          22},  // 1.33%
     {     3200,       1,          20},  // 2.55%
     {     3584,       1,          18},  // 1.74%
     {     4096,       1,          16},  // 0.15%
@@ -193,12 +192,13 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {     8192,       1,           8},  // 0.15%
     {     9344,       2,           7},  // 0.27%
     {    10880,       1,           6},  // 0.54%
+    {    13056,       2,           5},  // 0.47%
     {    13952,       3,           4},  // 0.70%
     {    16384,       1,           4},  // 0.15%
     {    19072,       3,           3},  // 3.14%
     {    21760,       2,           3},  // 0.47%
     {    24576,       3,           2},  // 0.05%
-    {    28032,       6,           2},  // 0.22%
+    {    28672,       7,           2},  // 0.02%
     {    32768,       1,           2},  // 0.15%
     {    38144,       5,           2},  // 7.41%
     {    40960,       4,           2},  // 6.71%
@@ -214,12 +214,12 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {   229376,       7,           2},  // 0.02%
     {   262144,       8,           2},  // 0.02%
 };
+constexpr absl::Span<const SizeClassInfo> kLegacySizeClasses(kLegacySizeClassesList);
 #elif TCMALLOC_PAGE_SHIFT == 18
 static_assert(kMaxSize == 262144, "kMaxSize mismatch");
 static const int kCount = 89;
-static_assert(kCount <= kNumClasses);
-const int SizeMap::kLegacySizeClassesCount = kCount;
-const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount] = {
+static_assert(kCount <= kNumBaseClasses);
+static constexpr SizeClassInfo kLegacySizeClassesList[kCount] = {
     // <bytes>, <pages>, <batch size>    <fixed>
     {        0,       0,           0},  // +Inf%
     {        8,       1,          32},  // 0.02%
@@ -242,57 +242,56 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {      176,       1,          32},  // 0.05%
     {      192,       1,          32},  // 0.04%
     {      208,       1,          32},  // 0.04%
-    {      240,       1,          32},  // 0.04%
+    {      232,       1,          32},  // 0.10%
     {      256,       1,          32},  // 0.02%
+    {      272,       1,          32},  // 0.10%
     {      304,       1,          32},  // 0.05%
-    {      336,       1,          32},  // 0.04%
-    {      360,       1,          32},  // 0.04%
-    {      408,       1,          32},  // 0.10%
-    {      456,       1,          32},  // 0.17%
+    {      352,       1,          32},  // 0.12%
+    {      400,       1,          32},  // 0.07%
+    {      472,       1,          32},  // 0.09%
     {      512,       1,          32},  // 0.02%
     {      576,       1,          32},  // 0.04%
     {      640,       1,          32},  // 0.17%
     {      704,       1,          32},  // 0.12%
     {      768,       1,          32},  // 0.12%
-    {      832,       1,          32},  // 0.04%
     {      896,       1,          32},  // 0.21%
     {     1024,       1,          32},  // 0.02%
     {     1152,       1,          32},  // 0.26%
     {     1280,       1,          32},  // 0.41%
+    {     1408,       1,          32},  // 0.12%
     {     1536,       1,          32},  // 0.41%
     {     1664,       1,          32},  // 0.36%
-    {     1792,       1,          32},  // 0.21%
     {     1920,       1,          32},  // 0.41%
     {     2048,       1,          32},  // 0.02%
-    {     2176,       1,          30},  // 0.41%
     {     2304,       1,          28},  // 0.71%
-    {     2432,       1,          26},  // 0.76%
     {     2560,       1,          25},  // 0.41%
-    {     2688,       1,          24},  // 0.56%
     {     2816,       1,          23},  // 0.12%
-    {     2944,       1,          22},  // 0.07%
     {     3072,       1,          21},  // 0.41%
     {     3328,       1,          19},  // 1.00%
     {     3584,       1,          18},  // 0.21%
     {     3840,       1,          17},  // 0.41%
     {     4096,       1,          16},  // 0.02%
+    {     4352,       1,          15},  // 0.41%
     {     4736,       1,          13},  // 0.66%
-    {     5504,       1,          11},  // 1.35%
-    {     6144,       1,          10},  // 1.61%
+    {     5632,       1,          11},  // 1.20%
     {     6528,       1,          10},  // 0.41%
-    {     6784,       1,           9},  // 1.71%
     {     7168,       1,           9},  // 1.61%
-    {     7680,       1,           8},  // 0.41%
     {     8192,       1,           8},  // 0.02%
     {     8704,       1,           7},  // 0.41%
     {     9344,       1,           7},  // 0.21%
+    {     9984,       1,           6},  // 1.00%
     {    10880,       1,           6},  // 0.41%
     {    11904,       1,           5},  // 0.12%
     {    13056,       1,           5},  // 0.41%
+    {    13696,       1,           4},  // 0.76%
     {    14464,       1,           4},  // 0.71%
+    {    15360,       1,           4},  // 0.41%
     {    16384,       1,           4},  // 0.02%
+    {    17408,       1,           3},  // 0.41%
     {    18688,       1,           3},  // 0.21%
+    {    20096,       1,           3},  // 0.36%
     {    21760,       1,           3},  // 0.41%
+    {    23808,       1,           2},  // 0.12%
     {    26112,       1,           2},  // 0.41%
     {    29056,       1,           2},  // 0.26%
     {    32768,       1,           2},  // 0.02%
@@ -308,15 +307,16 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {   131072,       1,           2},  // 0.02%
     {   149760,       3,           2},  // 5.03%
     {   174720,       2,           2},  // 0.03%
+    {   196608,       3,           2},  // 0.01%
     {   209664,       4,           2},  // 0.03%
     {   262144,       1,           2},  // 0.02%
 };
+constexpr absl::Span<const SizeClassInfo> kLegacySizeClasses(kLegacySizeClassesList);
 #elif TCMALLOC_PAGE_SHIFT == 12
 static_assert(kMaxSize == 8192, "kMaxSize mismatch");
 static const int kCount = 46;
-static_assert(kCount <= kNumClasses);
-const int SizeMap::kLegacySizeClassesCount = kCount;
-const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount] = {
+static_assert(kCount <= kNumBaseClasses);
+static constexpr SizeClassInfo kLegacySizeClassesList[kCount] = {
     // <bytes>, <pages>, <batch size>    <fixed>
     {        0,       0,           0},  // +Inf%
     {        8,       1,          32},  // 1.17%
@@ -331,30 +331,30 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {       80,       1,          32},  // 1.57%
     {       88,       1,          32},  // 2.37%
     {       96,       1,          32},  // 2.78%
-    {      104,       1,          32},  // 2.17%
-    {      120,       1,          32},  // 1.57%
+    {      112,       1,          32},  // 2.78%
     {      128,       1,          32},  // 1.17%
     {      144,       1,          32},  // 2.78%
     {      160,       1,          32},  // 3.60%
-    {      184,       1,          32},  // 2.37%
+    {      176,       1,          32},  // 2.37%
+    {      192,       1,          32},  // 2.78%
     {      208,       1,          32},  // 4.86%
     {      240,       1,          32},  // 1.57%
     {      256,       1,          32},  // 1.17%
     {      272,       1,          32},  // 1.57%
+    {      288,       1,          32},  // 2.78%
     {      312,       1,          32},  // 2.17%
     {      336,       1,          32},  // 2.78%
     {      368,       1,          32},  // 2.37%
     {      408,       1,          32},  // 1.57%
+    {      448,       1,          32},  // 2.78%
     {      512,       1,          32},  // 1.17%
     {      576,       2,          32},  // 2.18%
-    {      704,       2,          32},  // 6.40%
+    {      640,       2,          32},  // 7.29%
     {      768,       2,          32},  // 7.29%
     {      896,       2,          32},  // 2.18%
     {     1024,       2,          32},  // 0.59%
-    {     1152,       3,          32},  // 7.08%
     {     1280,       3,          32},  // 7.08%
     {     1536,       3,          32},  // 0.39%
-    {     1792,       4,          32},  // 1.88%
     {     2048,       4,          32},  // 0.29%
     {     2304,       4,          28},  // 1.88%
     {     2688,       4,          24},  // 1.88%
@@ -365,6 +365,7 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {     7168,       7,           9},  // 0.17%
     {     8192,       4,           8},  // 0.29%
 };
+constexpr absl::Span<const SizeClassInfo> kLegacySizeClasses(kLegacySizeClassesList);
 #else
 #error "Unsupported TCMALLOC_PAGE_SHIFT value!"
 #endif
@@ -372,9 +373,8 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
 #if TCMALLOC_PAGE_SHIFT == 13
 static_assert(kMaxSize == 262144, "kMaxSize mismatch");
 static const int kCount = 86;
-static_assert(kCount <= kNumClasses);
-const int SizeMap::kLegacySizeClassesCount = kCount;
-const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount] = {
+static_assert(kCount <= kNumBaseClasses);
+static constexpr SizeClassInfo kLegacySizeClassesList[kCount] = {
     // <bytes>, <pages>, <batch size>    <fixed>
     {        0,       0,           0},  // +Inf%
     {        8,       1,          32},  // 0.59%
@@ -425,14 +425,13 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {     3200,       2,          20},  // 2.70%
     {     3456,       3,          18},  // 1.79%
     {     3584,       4,          18},  // 1.74%
-    {     4096,       2,          16},  // 0.29%
+    {     4096,       1,          16},  // 0.59%
     {     4736,       3,          13},  // 3.99%
     {     5376,       2,          12},  // 1.88%
     {     6144,       3,          10},  // 0.20%
     {     6528,       4,          10},  // 0.54%
-    {     6784,       5,           9},  // 0.75%
     {     7168,       7,           9},  // 0.08%
-    {     8192,       2,           8},  // 0.29%
+    {     8192,       1,           8},  // 0.59%
     {     9472,       5,           6},  // 8.23%
     {    10240,       4,           6},  // 6.82%
     {    12288,       3,           5},  // 0.20%
@@ -455,6 +454,7 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {   114688,      14,           2},  // 0.04%
     {   131072,      16,           2},  // 0.04%
     {   139264,      17,           2},  // 0.03%
+    {   147456,      18,           2},  // 0.03%
     {   155648,      19,           2},  // 0.03%
     {   172032,      21,           2},  // 0.03%
     {   188416,      23,           2},  // 0.03%
@@ -463,12 +463,12 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {   237568,      29,           2},  // 0.02%
     {   262144,      32,           2},  // 0.02%
 };
+constexpr absl::Span<const SizeClassInfo> kLegacySizeClasses(kLegacySizeClassesList);
 #elif TCMALLOC_PAGE_SHIFT == 15
 static_assert(kMaxSize == 262144, "kMaxSize mismatch");
 static const int kCount = 78;
-static_assert(kCount <= kNumClasses);
-const int SizeMap::kLegacySizeClassesCount = kCount;
-const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount] = {
+static_assert(kCount <= kNumBaseClasses);
+static constexpr SizeClassInfo kLegacySizeClassesList[kCount] = {
     // <bytes>, <pages>, <batch size>    <fixed>
     {        0,       0,           0},  // +Inf%
     {        8,       1,          32},  // 0.15%
@@ -490,12 +490,10 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {      256,       1,          32},  // 0.15%
     {      272,       1,          32},  // 0.54%
     {      288,       1,          32},  // 0.84%
-    {      304,       1,          32},  // 0.89%
     {      320,       1,          32},  // 0.54%
-    {      336,       1,          32},  // 0.69%
     {      352,       1,          32},  // 0.24%
     {      384,       1,          32},  // 0.54%
-    {      416,       1,          32},  // 1.13%
+    {      400,       1,          32},  // 1.28%
     {      448,       1,          32},  // 0.34%
     {      480,       1,          32},  // 0.54%
     {      512,       1,          32},  // 0.15%
@@ -505,12 +503,14 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {      768,       1,          32},  // 1.74%
     {      832,       1,          32},  // 1.13%
     {      896,       1,          32},  // 1.74%
+    {      960,       1,          32},  // 0.54%
     {     1024,       1,          32},  // 0.15%
     {     1152,       1,          32},  // 1.74%
     {     1280,       1,          32},  // 2.55%
     {     1408,       1,          32},  // 1.33%
     {     1536,       1,          32},  // 1.74%
     {     1792,       1,          32},  // 1.74%
+    {     1920,       1,          32},  // 0.54%
     {     2048,       1,          32},  // 0.15%
     {     2176,       1,          30},  // 0.54%
     {     2304,       1,          28},  // 1.74%
@@ -533,7 +533,7 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {    19072,       3,           3},  // 3.14%
     {    21760,       2,           3},  // 0.47%
     {    24576,       3,           2},  // 0.05%
-    {    28032,       6,           2},  // 0.22%
+    {    28672,       7,           2},  // 0.02%
     {    32768,       1,           2},  // 0.15%
     {    38144,       5,           2},  // 7.41%
     {    40960,       4,           2},  // 6.71%
@@ -549,12 +549,12 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {   229376,       7,           2},  // 0.02%
     {   262144,       8,           2},  // 0.02%
 };
+constexpr absl::Span<const SizeClassInfo> kLegacySizeClasses(kLegacySizeClassesList);
 #elif TCMALLOC_PAGE_SHIFT == 18
 static_assert(kMaxSize == 262144, "kMaxSize mismatch");
 static const int kCount = 89;
-static_assert(kCount <= kNumClasses);
-const int SizeMap::kLegacySizeClassesCount = kCount;
-const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount] = {
+static_assert(kCount <= kNumBaseClasses);
+static constexpr SizeClassInfo kLegacySizeClassesList[kCount] = {
     // <bytes>, <pages>, <batch size>    <fixed>
     {        0,       0,           0},  // +Inf%
     {        8,       1,          32},  // 0.02%
@@ -571,19 +571,21 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {      176,       1,          32},  // 0.05%
     {      192,       1,          32},  // 0.04%
     {      208,       1,          32},  // 0.04%
+    {      224,       1,          32},  // 0.04%
     {      240,       1,          32},  // 0.04%
     {      256,       1,          32},  // 0.02%
+    {      272,       1,          32},  // 0.10%
     {      304,       1,          32},  // 0.05%
     {      336,       1,          32},  // 0.04%
-    {      368,       1,          32},  // 0.07%
-    {      416,       1,          32},  // 0.04%
-    {      464,       1,          32},  // 0.19%
+    {      352,       1,          32},  // 0.12%
+    {      400,       1,          32},  // 0.07%
+    {      448,       1,          32},  // 0.04%
+    {      480,       1,          32},  // 0.04%
     {      512,       1,          32},  // 0.02%
     {      576,       1,          32},  // 0.04%
     {      640,       1,          32},  // 0.17%
     {      704,       1,          32},  // 0.12%
     {      768,       1,          32},  // 0.12%
-    {      832,       1,          32},  // 0.04%
     {      896,       1,          32},  // 0.21%
     {     1024,       1,          32},  // 0.02%
     {     1152,       1,          32},  // 0.26%
@@ -596,34 +598,32 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {     2048,       1,          32},  // 0.02%
     {     2176,       1,          30},  // 0.41%
     {     2304,       1,          28},  // 0.71%
-    {     2432,       1,          26},  // 0.76%
     {     2560,       1,          25},  // 0.41%
-    {     2688,       1,          24},  // 0.56%
     {     2816,       1,          23},  // 0.12%
-    {     2944,       1,          22},  // 0.07%
     {     3072,       1,          21},  // 0.41%
-    {     3200,       1,          20},  // 1.15%
     {     3328,       1,          19},  // 1.00%
     {     3584,       1,          18},  // 0.21%
     {     3840,       1,          17},  // 0.41%
     {     4096,       1,          16},  // 0.02%
+    {     4352,       1,          15},  // 0.41%
     {     4736,       1,          13},  // 0.66%
-    {     5504,       1,          11},  // 1.35%
-    {     6144,       1,          10},  // 1.61%
+    {     5248,       1,          12},  // 1.96%
+    {     5888,       1,          11},  // 1.20%
     {     6528,       1,          10},  // 0.41%
-    {     6784,       1,           9},  // 1.71%
     {     7168,       1,           9},  // 1.61%
-    {     7680,       1,           8},  // 0.41%
     {     8192,       1,           8},  // 0.02%
     {     8704,       1,           7},  // 0.41%
     {     9344,       1,           7},  // 0.21%
-    {    10368,       1,           6},  // 1.15%
-    {    11392,       1,           5},  // 0.07%
-    {    12416,       1,           5},  // 0.56%
+    {     9984,       1,           6},  // 1.00%
+    {    10880,       1,           6},  // 0.41%
+    {    11904,       1,           5},  // 0.12%
+    {    13056,       1,           5},  // 0.41%
     {    13696,       1,           4},  // 0.76%
     {    14464,       1,           4},  // 0.71%
+    {    15360,       1,           4},  // 0.41%
     {    16384,       1,           4},  // 0.02%
     {    17408,       1,           3},  // 0.41%
+    {    18688,       1,           3},  // 0.21%
     {    20096,       1,           3},  // 0.36%
     {    21760,       1,           3},  // 0.41%
     {    23808,       1,           2},  // 0.12%
@@ -646,12 +646,12 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {   209664,       4,           2},  // 0.03%
     {   262144,       1,           2},  // 0.02%
 };
+constexpr absl::Span<const SizeClassInfo> kLegacySizeClasses(kLegacySizeClassesList);
 #elif TCMALLOC_PAGE_SHIFT == 12
 static_assert(kMaxSize == 8192, "kMaxSize mismatch");
 static const int kCount = 46;
-static_assert(kCount <= kNumClasses);
-const int SizeMap::kLegacySizeClassesCount = kCount;
-const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount] = {
+static_assert(kCount <= kNumBaseClasses);
+static constexpr SizeClassInfo kLegacySizeClassesList[kCount] = {
     // <bytes>, <pages>, <batch size>    <fixed>
     {        0,       0,           0},  // +Inf%
     {        8,       1,          32},  // 1.17%
@@ -681,7 +681,6 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {      512,       1,          32},  // 1.17%
     {      576,       2,          32},  // 2.18%
     {      640,       2,          32},  // 7.29%
-    {      704,       2,          32},  // 6.40%
     {      768,       2,          32},  // 7.29%
     {      896,       2,          32},  // 2.18%
     {     1024,       2,          32},  // 0.59%
@@ -695,11 +694,13 @@ const SizeClassInfo SizeMap::kLegacySizeClasses[SizeMap::kLegacySizeClassesCount
     {     3200,       4,          20},  // 2.70%
     {     3584,       7,          18},  // 0.17%
     {     4096,       4,          16},  // 0.29%
+    {     4736,       5,          13},  // 8.36%
     {     5376,       4,          12},  // 1.88%
     {     6144,       3,          10},  // 0.39%
     {     7168,       7,           9},  // 0.17%
     {     8192,       4,           8},  // 0.29%
 };
+constexpr absl::Span<const SizeClassInfo> kLegacySizeClasses(kLegacySizeClassesList);
 #else
 #error "Unsupported TCMALLOC_PAGE_SHIFT value!"
 #endif

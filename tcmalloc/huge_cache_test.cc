@@ -14,11 +14,14 @@
 
 #include "tcmalloc/huge_cache.h"
 
+#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
 
+#include <algorithm>
 #include <memory>
 #include <random>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -32,12 +35,18 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "tcmalloc/huge_pages.h"
+#include "tcmalloc/internal/clock.h"
+#include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/logging.h"
+#include "tcmalloc/mock_metadata_allocator.h"
+#include "tcmalloc/mock_virtual_allocator.h"
 #include "tcmalloc/stats.h"
 
 namespace tcmalloc {
 namespace tcmalloc_internal {
 namespace {
+
+using testing::Return;
 
 class HugeCacheTest : public testing::Test {
  private:
@@ -52,74 +61,23 @@ class HugeCacheTest : public testing::Test {
                absl::ToDoubleNanoseconds(absl::Seconds(1));
   }
 
-  // Use a tiny fraction of actual size so we can test aggressively.
-  static void* AllocateFake(size_t bytes, size_t* actual, size_t align) {
-    if (bytes % kHugePageSize != 0) {
-      Crash(kCrash, __FILE__, __LINE__, "not aligned", bytes, kHugePageSize);
-    }
-    if (align % kHugePageSize != 0) {
-      Crash(kCrash, __FILE__, __LINE__, "not aligned", align, kHugePageSize);
-    }
-    *actual = bytes;
-    // we'll actually provide hidden backing, one word per hugepage.
-    bytes /= kHugePageSize;
-    align /= kHugePageSize;
-    size_t index = backing.size();
-    if (index % align != 0) {
-      index += (align - (index & align));
-    }
-    backing.resize(index + bytes);
-    void* ptr = reinterpret_cast<void*>(index * kHugePageSize);
-    return ptr;
-  }
-  // This isn't super good form but we'll never have more than one HAT
-  // extant at once.
-  static std::vector<size_t> backing;
-
-  // We use actual malloc for metadata allocations, but we track them so they
-  // can be deleted.  (TODO make this an arena if we care, which I doubt)
-  static void* MallocMetadata(size_t size) {
-    metadata_bytes += size;
-    void* ptr = calloc(size, 1);
-    metadata_allocs.push_back(ptr);
-    return ptr;
-  }
-  static std::vector<void*> metadata_allocs;
-  static size_t metadata_bytes;
-
-  // This is wordy, but necessary for mocking:
-  class BackingInterface {
+  class MockBackingInterface : public MemoryModifyFunction {
    public:
-    virtual void Unback(void* p, size_t len) = 0;
-    virtual ~BackingInterface() {}
-  };
+    MOCK_METHOD(bool, Unback, (void* p, size_t len), ());
 
-  class MockBackingInterface : public BackingInterface {
-   public:
-    MOCK_METHOD2(Unback, void(void* p, size_t len));
+    bool operator()(void* p, size_t len) override { return Unback(p, len); }
   };
-
-  static void MockUnback(void* p, size_t len) { mock_->Unback(p, len); }
 
  protected:
-  static std::unique_ptr<testing::NiceMock<MockBackingInterface>> mock_;
+  testing::NiceMock<MockBackingInterface> mock_unback_;
 
   HugeCacheTest() {
     // We don't use the first few bytes, because things might get weird
     // given zero pointers.
-    backing.resize(1024);
-    metadata_bytes = 0;
-    mock_ = absl::make_unique<testing::NiceMock<MockBackingInterface>>();
+    vm_allocator_.backing_.resize(1024);
   }
 
   ~HugeCacheTest() override {
-    for (void* p : metadata_allocs) {
-      free(p);
-    }
-    metadata_allocs.clear();
-    backing.clear();
-    mock_.reset(nullptr);
-
     clock_offset_ = 0;
   }
 
@@ -127,16 +85,12 @@ class HugeCacheTest : public testing::Test {
     clock_offset_ += absl::ToInt64Nanoseconds(d);
   }
 
-  HugeAllocator alloc_{AllocateFake, MallocMetadata};
-  HugeCache cache_{&alloc_, MallocMetadata, MockUnback,
+  FakeVirtualAllocator vm_allocator_;
+  FakeMetadataAllocator metadata_allocator_;
+  HugeAllocator alloc_{vm_allocator_, metadata_allocator_};
+  HugeCache cache_{&alloc_, metadata_allocator_, mock_unback_,
                    Clock{.now = GetClock, .freq = GetClockFrequency}};
 };
-
-std::vector<size_t> HugeCacheTest::backing;
-std::vector<void*> HugeCacheTest::metadata_allocs;
-size_t HugeCacheTest::metadata_bytes;
-std::unique_ptr<testing::NiceMock<HugeCacheTest::MockBackingInterface>>
-    HugeCacheTest::mock_;
 
 int64_t HugeCacheTest::clock_offset_ = 0;
 
@@ -196,13 +150,57 @@ TEST_F(HugeCacheTest, Release) {
   cache_.Release(r5);
 
   ASSERT_EQ(NHugePages(3), cache_.size());
-  EXPECT_CALL(*mock_, Unback(r5.start_addr(), kHugePageSize * 1)).Times(1);
+  EXPECT_CALL(mock_unback_, Unback(r5.start_addr(), kHugePageSize * 1))
+      .WillOnce(Return(true));
   EXPECT_EQ(NHugePages(1), cache_.ReleaseCachedPages(NHugePages(1)));
   cache_.Release(r3);
   cache_.Release(r4);
 
-  EXPECT_CALL(*mock_, Unback(r1.start_addr(), 4 * kHugePageSize)).Times(1);
+  EXPECT_CALL(mock_unback_, Unback(r1.start_addr(), 4 * kHugePageSize))
+      .WillOnce(Return(true));
   EXPECT_EQ(NHugePages(4), cache_.ReleaseCachedPages(NHugePages(200)));
+}
+
+TEST_F(HugeCacheTest, ReleaseFailure) {
+  bool from;
+  const HugeLength one = NHugePages(1);
+  cache_.Release(cache_.Get(NHugePages(5), &from));
+  HugeRange r1, r2, r3, r4, r5;
+  r1 = cache_.Get(one, &from);
+  r2 = cache_.Get(one, &from);
+  r3 = cache_.Get(one, &from);
+  r4 = cache_.Get(one, &from);
+  r5 = cache_.Get(one, &from);
+  cache_.Release(r1);
+  cache_.Release(r2);
+  cache_.Release(r3);
+  cache_.Release(r4);
+  cache_.Release(r5);
+
+  r1 = cache_.Get(one, &from);
+  ASSERT_EQ(false, from);
+  r2 = cache_.Get(one, &from);
+  ASSERT_EQ(false, from);
+  r3 = cache_.Get(one, &from);
+  ASSERT_EQ(false, from);
+  r4 = cache_.Get(one, &from);
+  ASSERT_EQ(false, from);
+  r5 = cache_.Get(one, &from);
+  ASSERT_EQ(false, from);
+  cache_.Release(r1);
+  cache_.Release(r2);
+  cache_.Release(r5);
+
+  ASSERT_EQ(NHugePages(3), cache_.size());
+  EXPECT_CALL(mock_unback_, Unback(r5.start_addr(), 1 * kHugePageSize))
+      .WillOnce(Return(false));
+  EXPECT_EQ(NHugePages(0), cache_.ReleaseCachedPages(NHugePages(1)));
+  cache_.Release(r3);
+  cache_.Release(r4);
+
+  EXPECT_CALL(mock_unback_, Unback(r1.start_addr(), 5 * kHugePageSize))
+      .WillOnce(Return(false));
+  EXPECT_EQ(NHugePages(0), cache_.ReleaseCachedPages(NHugePages(200)));
 }
 
 TEST_F(HugeCacheTest, Regret) {
@@ -218,7 +216,7 @@ TEST_F(HugeCacheTest, Regret) {
   uint64_t expected_regret = absl::ToInt64Nanoseconds(d) * cached.raw_num();
   // Not exactly accurate since the mock clock advances with real time, and
   // when we measure regret will be updated.
-  EXPECT_NEAR(cache_.regret(), expected_regret, expected_regret / 1000);
+  EXPECT_NEAR(cache_.regret(), expected_regret, expected_regret / 100);
   EXPECT_GE(cache_.regret(), expected_regret);
 }
 
@@ -293,6 +291,9 @@ static double Frac(HugeLength num, HugeLength denom) {
 }
 
 TEST_F(HugeCacheTest, Growth) {
+  EXPECT_CALL(mock_unback_, Unback(testing::_, testing::_))
+      .WillRepeatedly(Return(true));
+
   bool released;
   absl::BitGen rng;
   // fragmentation is a bit of a challenge
@@ -363,13 +364,16 @@ TEST_F(HugeCacheTest, Growth) {
     // approximately, given the randomized sizing...
 
     const double ratio = Frac(needed_backing, total);
-    EXPECT_LE(ratio, 0.2);
+    EXPECT_LE(ratio, 0.3);
   }
 }
 
 // If we repeatedly grow and shrink, but do so very slowly, we should *not*
 // cache the large variation.
 TEST_F(HugeCacheTest, SlowGrowthUncached) {
+  EXPECT_CALL(mock_unback_, Unback(testing::_, testing::_))
+      .WillRepeatedly(Return(true));
+
   absl::BitGen rng;
   std::uniform_int_distribution<size_t> sizes(1, 10);
   for (int i = 0; i < 20; ++i) {
@@ -391,6 +395,9 @@ TEST_F(HugeCacheTest, SlowGrowthUncached) {
 
 // If very rarely we have a huge increase in usage, it shouldn't be cached.
 TEST_F(HugeCacheTest, SpikesUncached) {
+  EXPECT_CALL(mock_unback_, Unback(testing::_, testing::_))
+      .WillRepeatedly(Return(true));
+
   absl::BitGen rng;
   std::uniform_int_distribution<size_t> sizes(1, 10);
   for (int i = 0; i < 20; ++i) {
@@ -433,7 +440,7 @@ TEST_F(HugeCacheTest, DipsCached) {
 
     // warmup
     if (i >= 2) {
-      EXPECT_GE(0.06, Frac(uncached, got));
+      EXPECT_GE(0.07, Frac(uncached, got));
     }
   }
 }

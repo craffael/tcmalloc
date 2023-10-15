@@ -23,6 +23,7 @@
 
 #include "absl/base/attributes.h"
 #include "absl/base/optimization.h"
+#include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/logging.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
@@ -59,14 +60,17 @@ inline void* SLL_Pop(void** list) {
 // LinkedList forms an in-place linked list with its void* elements.
 class LinkedList {
  private:
-  void* list_;       // Linked list.
-  uint32_t length_;  // Current length.
+  void* list_ = nullptr;  // Linked list.
+  uint32_t length_ = 0;   // Current length.
 
  public:
-  void Init() {
-    list_ = nullptr;
-    length_ = 0;
-  }
+  constexpr LinkedList() = default;
+
+  // Not copy constructible or movable.
+  LinkedList(const LinkedList&) = delete;
+  LinkedList(LinkedList&&) = delete;
+  LinkedList& operator=(const LinkedList&) = delete;
+  LinkedList& operator=(LinkedList&&) = delete;
 
   // Return current length of list
   size_t length() const { return length_; }
@@ -176,6 +180,12 @@ class TList {
 
   // Initialize to empty list.
   constexpr TList() { head_.next_ = head_.prev_ = &head_; }
+
+  // Not copy constructible/movable.
+  TList(const TList&) = delete;
+  TList(TList&&) = delete;
+  TList& operator=(const TList&) = delete;
+  TList& operator=(TList&&) = delete;
 
   bool empty() const { return head_.next_ == &head_; }
 

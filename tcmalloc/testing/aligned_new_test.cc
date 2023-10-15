@@ -17,17 +17,16 @@
 
 #include <memory>
 #include <new>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-#include "gmock/gmock.h"
+#include "benchmark/benchmark.h"
 #include "gtest/gtest.h"
 #include "absl/base/attributes.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/debugging/leak_check.h"
-#include "benchmark/benchmark.h"
-#include "tcmalloc/internal/logging.h"
 #include "tcmalloc/malloc_extension.h"
 
 namespace tcmalloc {

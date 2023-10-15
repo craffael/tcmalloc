@@ -18,7 +18,7 @@
 
 #include <algorithm>
 
-#include "absl/base/optimization.h"  // ABSL_INTERNAL_ASSUME
+#include "absl/base/optimization.h"
 #include "absl/numeric/bits.h"
 #include "tcmalloc/common.h"
 #include "tcmalloc/internal/atomic_stats_counter.h"
@@ -33,48 +33,45 @@ GOOGLE_MALLOC_SECTION_BEGIN
 namespace tcmalloc {
 namespace tcmalloc_internal {
 
-void Span::Sample(StackTrace* stack) {
-  ASSERT(!sampled_ && stack);
+void Span::Sample(SampledAllocation* sampled_allocation) {
+  CHECK_CONDITION(!sampled_ && sampled_allocation);
   sampled_ = 1;
-  sampled_stack_ = stack;
-  Static::sampled_objects_.prepend(this);
+  sampled_allocation_ = sampled_allocation;
 
   // The cast to value matches Unsample.
   tcmalloc_internal::StatsCounter::Value allocated_bytes =
       static_cast<tcmalloc_internal::StatsCounter::Value>(
-          AllocatedBytes(*stack, true));
-  // LossyAdd is ok: writes to sampled_objects_size_ guarded by pageheap_lock.
-  Static::sampled_objects_size_.LossyAdd(allocated_bytes);
+          AllocatedBytes(sampled_allocation->sampled_stack));
+  tc_globals.sampled_objects_size_.Add(allocated_bytes);
+  tc_globals.total_sampled_count_.Add(1);
 }
 
-StackTrace* Span::Unsample() {
+SampledAllocation* Span::Unsample() {
   if (!sampled_) {
     return nullptr;
   }
+  CHECK_CONDITION(sampled_ && sampled_allocation_);
   sampled_ = 0;
-  StackTrace* stack = sampled_stack_;
-  sampled_stack_ = nullptr;
-  RemoveFromList();  // from Static::sampled_objects_
+  SampledAllocation* sampled_allocation = sampled_allocation_;
+  sampled_allocation_ = nullptr;
+
   // The cast to Value ensures no funny business happens during the negation if
   // sizeof(size_t) != sizeof(Value).
   tcmalloc_internal::StatsCounter::Value neg_allocated_bytes =
       -static_cast<tcmalloc_internal::StatsCounter::Value>(
-          AllocatedBytes(*stack, true));
-  // LossyAdd is ok: writes to sampled_objects_size_ guarded by pageheap_lock.
-  Static::sampled_objects_size_.LossyAdd(neg_allocated_bytes);
-  return stack;
+          AllocatedBytes(sampled_allocation->sampled_stack));
+  tc_globals.sampled_objects_size_.Add(neg_allocated_bytes);
+  return sampled_allocation;
 }
 
-double Span::Fragmentation() const {
-  const size_t cl = Static::pagemap().sizeclass(first_page_);
-  if (cl == 0) {
+double Span::Fragmentation(size_t object_size) const {
+  if (object_size == 0) {
     // Avoid crashes in production mode code, but report in tests.
-    ASSERT(cl != 0);
+    ASSERT(object_size != 0);
     return 0;
   }
-  const size_t obj_size = Static::sizemap().class_to_size(cl);
-  const size_t span_objects = bytes_in_span() / obj_size;
-  const size_t live = allocated_;
+  const size_t span_objects = bytes_in_span() / object_size;
+  const size_t live = allocated_.load(std::memory_order_relaxed);
   if (live == 0) {
     // Avoid crashes in production mode code, but report in tests.
     ASSERT(live != 0);
@@ -137,7 +134,7 @@ void Span::AverageFreelistAddedTime(const Span* other) {
 
 Span::ObjIdx Span::PtrToIdx(void* ptr, size_t size) const {
   // Object index is an offset from span start divided by a power-of-two.
-  // The divisors are choosen so that
+  // The divisors are chosen so that
   // (1) objects are aligned on the divisor,
   // (2) index fits into 16 bits and
   // (3) the index of the beginning of all objects is strictly less than
@@ -154,7 +151,7 @@ Span::ObjIdx Span::PtrToIdx(void* ptr, size_t size) const {
     // span, instead we compute the offset by taking low kPageShift bits of the
     // pointer.
     ASSERT(PageIdContaining(ptr) == first_page_);
-    off = (p & (kPageSize - 1)) / kAlignment;
+    off = (p & (kPageSize - 1)) / static_cast<size_t>(kAlignment);
   } else {
     off = (p - first_page_.start_uintptr()) / SizeMap::kMultiPageAlignment;
   }
@@ -203,9 +200,11 @@ size_t Span::BitmapFreelistPopBatch(void** __restrict batch, size_t N,
 #ifndef NDEBUG
   size_t after = bitmap_.CountBits(0, 64);
   ASSERT(after + count == before);
-  ASSERT(allocated_ + count == embed_count_ - after);
+  ASSERT(allocated_.load(std::memory_order_relaxed) + count ==
+         embed_count_ - after);
 #endif  // NDEBUG
-  allocated_ += count;
+  allocated_.store(allocated_.load(std::memory_order_relaxed) + count,
+                   std::memory_order_relaxed);
   return count;
 }
 
@@ -230,7 +229,7 @@ uint16_t Span::CalcReciprocal(size_t size) {
   // TODO(djgove) These divides can be computed once at start up.
   size_t reciprocal = 0;
   // The spans hold objects up to kMaxSize, so it's safe to assume.
-  ABSL_INTERNAL_ASSUME(size <= kMaxSize);
+  ABSL_ASSUME(size <= kMaxSize);
   if (size <= SizeMap::kMultiPageSize) {
     reciprocal = kBitmapScalingDenominator / (size >> kAlignmentShift);
   } else {
@@ -250,13 +249,14 @@ void Span::BitmapBuildFreelist(size_t size, size_t count) {
   embed_count_ = count;
 #endif  // NDEBUG
   reciprocal_ = CalcReciprocal(size);
-  allocated_ = 0;
+  allocated_.store(0, std::memory_order_relaxed);
   bitmap_.Clear();  // bitmap_ can be non-zero from a previous use.
   bitmap_.SetRange(0, count);
   ASSERT(bitmap_.CountBits(0, 64) == count);
 }
 
 int Span::BuildFreelist(size_t size, size_t count, void** batch, int N) {
+  ASSERT(count > 0);
   freelist_ = kListEnd;
 
   if (size >= kBitmapMinObjectSize) {
@@ -271,9 +271,9 @@ int Span::BuildFreelist(size_t size, size_t count, void** batch, int N) {
     batch[i] = ptr;
     ptr += size;
   }
-  allocated_ = result;
+  allocated_.store(result, std::memory_order_relaxed);
 
-  ObjIdx idxStep = size / kAlignment;
+  ObjIdx idxStep = size / static_cast<size_t>(kAlignment);
   // Valid objects are {0, idxStep, idxStep * 2, ..., idxStep * (count - 1)}.
   if (size > SizeMap::kMultiPageSize) {
     idxStep = size / SizeMap::kMultiPageAlignment;

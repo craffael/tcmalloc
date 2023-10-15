@@ -16,22 +16,22 @@
 // requires careful memory accounting, we avoid allocating at critical times and
 // avoid Google Test/background threads.
 
-#include <fcntl.h>
+#include <errno.h>
+#include <stddef.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
-#include <sys/stat.h>
 #include <sys/types.h>
-#include <unistd.h>
 
 #include <cstdio>
 #include <limits>
+#include <optional>
 #include <vector>
 
-#include "absl/random/random.h"
-#include "absl/strings/string_view.h"
-#include "absl/types/optional.h"
 #include "benchmark/benchmark.h"
-#include "tcmalloc/common.h"
+#include "absl/random/random.h"
+#include "absl/types/optional.h"
+#include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/internal/memory_stats.h"
 #include "tcmalloc/malloc_extension.h"
@@ -45,7 +45,7 @@ int64_t GetRSS() {
 }
 
 int64_t UnmappedBytes() {
-  absl::optional<size_t> value = tcmalloc::MallocExtension::GetNumericProperty(
+  std::optional<size_t> value = tcmalloc::MallocExtension::GetNumericProperty(
       "tcmalloc.pageheap_unmapped_bytes");
   CHECK_CONDITION(value.has_value());
   return *value;

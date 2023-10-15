@@ -30,7 +30,6 @@
 #include "tcmalloc/page_heap_allocator.h"
 #include "tcmalloc/sampler.h"
 #include "tcmalloc/static_vars.h"
-#include "tcmalloc/tracking.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
 namespace tcmalloc {
@@ -42,27 +41,30 @@ namespace tcmalloc_internal {
 
 class ThreadCache {
  public:
-  void Init(pthread_t tid) ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
+  explicit ThreadCache(pthread_t tid)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
   void Cleanup();
 
   // Accessors (mostly just for printing stats)
-  int freelist_length(size_t cl) const { return list_[cl].length(); }
+  int freelist_length(size_t size_class) const {
+    return list_[size_class].length();
+  }
 
   // Total byte size in cache
   size_t Size() const { return size_; }
 
   // Allocate an object of the given size class. When allocation fails
   // (from this cache and after running FetchFromCentralCache),
-  // OOMHandler(size) is called and its return value is
-  // returned from Allocate. OOMHandler is used to parameterize
-  // out-of-memory handling (raising exception, returning nullptr,
-  // calling new_handler or anything else). "Passing" OOMHandler in
-  // this way allows Allocate to be used in tail-call position in
-  // fast-path, making allocate tail-call slow path code.
-  template <void* OOMHandler(size_t)>
-  void* Allocate(size_t cl);
+  // `Policy::oom_handler(size)` is called and its return value is
+  // returned from Allocate. 'Policy' is used to created the desired raw or
+  // sized pointer value, and to parameterize out-of-memory handling (raising
+  // exception, returning nullptr, calling new_handler or anything else).
+  // Using policies in this way allows Allocate to be used in tail-call
+  // position in fast-path, making allocate tail-call slow path code.
+  template <typename Policy>
+  auto Allocate(size_t size_class);
 
-  void Deallocate(void* ptr, size_t cl);
+  void Deallocate(void* ptr, size_t size_class);
 
   void Scavenge();
 
@@ -95,14 +97,14 @@ class ThreadCache {
     return overall_thread_cache_size_;
   }
 
-  template <void* OOMHandler(size_t)>
-  void* ABSL_ATTRIBUTE_NOINLINE AllocateSlow(size_t cl, size_t allocated_size) {
-    tracking::Report(kMallocMiss, cl, 1);
-    void* ret = FetchFromCentralCache(cl, allocated_size);
+  template <typename Policy>
+  ABSL_ATTRIBUTE_NOINLINE auto AllocateSlow(size_t size_class,
+                                            size_t allocated_size) {
+    void* ret = FetchFromCentralCache(size_class, allocated_size);
     if (ABSL_PREDICT_TRUE(ret != nullptr)) {
-      return ret;
+      return Policy::as_pointer(ret, allocated_size);
     }
-    return OOMHandler(allocated_size);
+    return Policy::handle_oom(size_class);
   }
 
  private:
@@ -126,7 +128,6 @@ class ThreadCache {
 
    public:
     void Init() {
-      LinkedList::Init();
       lowater_ = 0;
       max_length_ = 1;
       length_overages_ = 0;
@@ -171,16 +172,16 @@ class ThreadCache {
 
   // Gets and returns an object from the central cache, and, if possible,
   // also adds some objects of that size class to this thread cache.
-  void* FetchFromCentralCache(size_t cl, size_t byte_size);
+  void* FetchFromCentralCache(size_t size_class, size_t byte_size);
 
   // Releases some number of items from src.  Adjusts the list's max_length
-  // to eventually converge on num_objects_to_move(cl).
-  void ListTooLong(FreeList* list, size_t cl);
+  // to eventually converge on num_objects_to_move(size_class).
+  void ListTooLong(FreeList* list, size_t size_class);
 
-  void DeallocateSlow(void* ptr, FreeList* list, size_t cl);
+  void DeallocateSlow(void* ptr, FreeList* list, size_t size_class);
 
   // Releases N items from this thread cache.
-  void ReleaseToCentralCache(FreeList* src, size_t cl, int N);
+  void ReleaseToCentralCache(FreeList* src, size_t size_class, int N);
 
   // Increase max_size_ by reducing unclaimed_cache_space_ or by
   // reducing the max_size_ of some other thread.  In both cases,
@@ -203,9 +204,8 @@ class ThreadCache {
   //
   // Since using dlopen on a malloc replacement is asking for trouble in any
   // case, that's a good tradeoff for us.
-#ifdef ABSL_HAVE_TLS
-  static __thread ThreadCache* thread_local_data_ ABSL_ATTRIBUTE_INITIAL_EXEC;
-#endif
+  ABSL_CONST_INIT static thread_local ThreadCache* thread_local_data_
+      ABSL_ATTRIBUTE_INITIAL_EXEC;
 
   // Thread-specific key.  Initialization here is somewhat tricky
   // because some Linux startup code invokes malloc() before it
@@ -244,12 +244,6 @@ class ThreadCache {
   size_t size_;      // Combined size of data
   size_t max_size_;  // size_ > max_size_ --> Scavenge()
 
-#ifndef ABSL_HAVE_TLS
-  // We sample allocations, biased by the size of the allocation.
-  // If we have TLS, then we use sampler defined in tcmalloc.cc.
-  Sampler sampler_;
-#endif
-
   pthread_t tid_;
   bool in_setspecific_;
 
@@ -279,32 +273,28 @@ class ThreadCache {
 };
 
 inline AllocatorStats ThreadCache::HeapStats() {
-  return Static::threadcache_allocator().stats();
+  return tc_globals.threadcache_allocator().stats();
 }
 
-#ifndef ABSL_HAVE_TLS
-inline Sampler* ThreadCache::GetSampler() { return &sampler_; }
-#endif
+template <typename Policy>
+inline ABSL_ATTRIBUTE_ALWAYS_INLINE auto ThreadCache::Allocate(
+    size_t size_class) {
+  const size_t allocated_size = tc_globals.sizemap().class_to_size(size_class);
 
-template <void* OOMHandler(size_t)>
-inline void* ABSL_ATTRIBUTE_ALWAYS_INLINE ThreadCache::Allocate(size_t cl) {
-  const size_t allocated_size = Static::sizemap().class_to_size(cl);
-
-  FreeList* list = &list_[cl];
+  FreeList* list = &list_[size_class];
   void* ret;
   if (ABSL_PREDICT_TRUE(list->TryPop(&ret))) {
-    tracking::Report(kMallocHit, cl, 1);
     size_ -= allocated_size;
-    return ret;
+    return Policy::as_pointer(ret, allocated_size);
   }
 
-  return AllocateSlow<OOMHandler>(cl, allocated_size);
+  return AllocateSlow<Policy>(size_class, allocated_size);
 }
 
-inline void ABSL_ATTRIBUTE_ALWAYS_INLINE ThreadCache::Deallocate(void* ptr,
-                                                                 size_t cl) {
-  FreeList* list = &list_[cl];
-  size_ += Static::sizemap().class_to_size(cl);
+inline void ABSL_ATTRIBUTE_ALWAYS_INLINE
+ThreadCache::Deallocate(void* ptr, size_t size_class) {
+  FreeList* list = &list_[size_class];
+  size_ += tc_globals.sizemap().class_to_size(size_class);
   ssize_t size_headroom = max_size_ - size_ - 1;
 
   list->Push(ptr);
@@ -315,22 +305,13 @@ inline void ABSL_ATTRIBUTE_ALWAYS_INLINE ThreadCache::Deallocate(void* ptr,
   // In the common case we're done, and in that case we need a single branch
   // because of the bitwise-or trick that follows.
   if ((list_headroom | size_headroom) < 0) {
-    DeallocateSlow(ptr, list, cl);
-  } else {
-    tracking::Report(kFreeHit, cl, 1);
+    DeallocateSlow(ptr, list, size_class);
   }
 }
 
 inline ThreadCache* ABSL_ATTRIBUTE_ALWAYS_INLINE
 ThreadCache::GetCacheIfPresent() {
-#ifdef ABSL_HAVE_TLS
-  // __thread is faster
   return thread_local_data_;
-#else
-  return tsd_inited_
-             ? reinterpret_cast<ThreadCache*>(pthread_getspecific(heap_key_))
-             : nullptr;
-#endif
 }
 
 inline ThreadCache* ThreadCache::GetCache() {

@@ -18,14 +18,16 @@
 #include <syscall.h>
 #include <unistd.h>
 
+#include <new>
 #include <vector>
 
 #include "gtest/gtest.h"
 #include "absl/random/random.h"
 #include "tcmalloc/common.h"
+#include "tcmalloc/internal/affinity.h"
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/internal/numa.h"
-#include "tcmalloc/internal/util.h"
+#include "tcmalloc/internal/page_size.h"
 #include "tcmalloc/static_vars.h"
 #include "tcmalloc/testing/testutil.h"
 
@@ -33,14 +35,14 @@ namespace tcmalloc::tcmalloc_internal {
 namespace {
 
 // Returns the NUMA node whose memory is used to back the allocation at ptr.
-size_t BackingNode(void *const ptr) {
+size_t BackingNode(void* const ptr) {
   // Ensure that at least the page containing the first byte of our
   // allocation is actually backed by physical memory by writing to it.
   memset(ptr, 42, 1);
 
   // The move_pages syscall expects page aligned addresses; we'll check the
   // page containing the first byte of the allocation at ptr.
-  static const size_t page_size = getpagesize();
+  static const size_t page_size = GetPageSize();
   uintptr_t page_addr = reinterpret_cast<uintptr_t>(ptr) & ~(page_size - 1);
 
   // Retrieve the number of the NUMA node whose memory ptr is backed by. The
@@ -56,13 +58,13 @@ size_t BackingNode(void *const ptr) {
 // Test that allocations are performed using memory within the appropriate NUMA
 // partition.
 TEST(NumaLocalityTest, AllocationsAreLocal) {
-  if (!Static::numa_topology().numa_aware()) {
+  if (!tc_globals.numa_topology().numa_aware()) {
     GTEST_SKIP() << "NUMA awareness is disabled";
   }
 
   // We don't currently enforce NUMA locality for sampled allocations; disable
   // sampling for the test.
-  ScopedProfileSamplingRate s(0);
+  ScopedNeverSample never_sample;
 
   absl::BitGen gen;
   constexpr size_t kIterations = 1000;
@@ -82,7 +84,7 @@ TEST(NumaLocalityTest, AllocationsAreLocal) {
 
     // Perform a randomly sized memory allocation.
     const size_t alloc_size = absl::Uniform(gen, 1ul, 5ul << 20);
-    void *ptr = ::operator new(alloc_size);
+    void* ptr = ::operator new(alloc_size);
     ASSERT_NE(ptr, nullptr);
 
     // Discover which NUMA node contains the memory backing that allocation.

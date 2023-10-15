@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <string.h>
 
 #include <cstdio>
 #include <string>
@@ -21,7 +20,7 @@
 #include "absl/strings/string_view.h"
 #include "tcmalloc/malloc_extension.h"
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   // Why examine mallocz data, rather than just call decide_want_hpaa?  We want
   // as close of an end-to-end validation as we can get.
   std::string input = tcmalloc::MallocExtension::GetStats();

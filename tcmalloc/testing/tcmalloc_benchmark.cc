@@ -14,13 +14,31 @@
 
 #include <malloc.h>
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
 #include <new>
+#include <string>
+#include <thread>
 #include <vector>
 
+#include "absl/base/attributes.h"
 #include "absl/random/random.h"
+#include "absl/synchronization/notification.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "benchmark/benchmark.h"
+#include "tcmalloc/common.h"
 #include "tcmalloc/internal/declarations.h"
 #include "tcmalloc/malloc_extension.h"
+
+extern "C" ABSL_ATTRIBUTE_WEAK void MallocExtension_Internal_GetStats(
+    std::string* ret);
+extern "C" ABSL_ATTRIBUTE_WEAK int MallocExtension_Internal_GetStatsInPbtxt(
+    char* buffer, int buffer_length);
 
 namespace tcmalloc {
 namespace {
@@ -55,6 +73,18 @@ static void BM_size_returning_new_delete(benchmark::State& state) {
 }
 BENCHMARK(BM_size_returning_new_delete)->Range(1, 1 << 20);
 
+static void BM_nallocx_new_sized_delete(benchmark::State& state) {
+  const int arg = state.range(0);
+
+  for (auto s : state) {
+    size_t size = nallocx(arg, 0);
+    benchmark::DoNotOptimize(size);
+    void* ptr = ::operator new(size);
+    ::operator delete(ptr, size);
+  }
+}
+BENCHMARK(BM_nallocx_new_sized_delete)->Range(1, 1 << 20);
+
 static void BM_aligned_new(benchmark::State& state) {
   const int size = state.range(0);
   const int alignment = state.range(1);
@@ -64,7 +94,23 @@ static void BM_aligned_new(benchmark::State& state) {
     operator delete(ptr, size, static_cast<std::align_val_t>(alignment));
   }
 }
-BENCHMARK(BM_aligned_new)->RangePair(1, 1 << 20, 8, 64);
+BENCHMARK(BM_aligned_new)->RangePair(1, 1 << 20, 8, 64)->ArgPair(65, 64);
+
+static void BM_new_delete_slow_path(benchmark::State& state) {
+  // The benchmark is intended to cover CpuCache overflow/underflow paths,
+  // transfer cache and a bit of the central freelist.
+  std::vector<void*> allocs((4 << 10) + 128);
+  const size_t size = state.range(0);
+  for (auto s : state) {
+    for (void*& p : allocs) {
+      p = ::operator new(size);
+    }
+    for (void* p : allocs) {
+      ::operator delete(p, size);
+    }
+  }
+}
+BENCHMARK(BM_new_delete_slow_path)->Arg(8)->Arg(8192);
 
 static void* malloc_pages(size_t pages) {
 #if defined(TCMALLOC_256K_PAGES)
@@ -173,6 +219,263 @@ static void BM_random_new_delete(benchmark::State& state) {
   }
 }
 BENCHMARK(BM_random_new_delete);
+
+static void BM_get_stats(benchmark::State& state) {
+  std::vector<std::unique_ptr<char[]>> allocations;
+  const int num_allocations = state.range(0);
+  allocations.reserve(num_allocations);
+
+  // Perform randomly sized allocations which will be kept live whilst we
+  // collect stats, allowing us to observe the impact of heap size on the time
+  // taken to collect stats.
+  absl::BitGen rand;
+  for (int i = 0; i < num_allocations; i++) {
+    const size_t size = absl::Uniform<size_t>(rand, 1, 1 << 20);
+    allocations.emplace_back(new char[size]);
+  }
+
+  // Here we go; collect stats.
+  for (auto s : state) {
+    const std::string stats = MallocExtension::GetStats();
+    benchmark::DoNotOptimize(stats);
+  }
+}
+BENCHMARK(BM_get_stats)->Range(1, 1 << 20);
+
+static void BM_get_stats_internal(benchmark::State& state) {
+  if (&MallocExtension_Internal_GetStats == nullptr) {
+    // Sanitizer builds don't provide this function.
+    return;
+  }
+  std::vector<std::unique_ptr<char[]>> allocations;
+  const int num_allocations = state.range(0);
+  allocations.reserve(num_allocations);
+
+  // Perform randomly sized allocations which will be kept live whilst we
+  // collect stats, allowing us to observe the impact of heap size on the time
+  // taken to collect stats.
+  absl::BitGen rand;
+  for (int i = 0; i < num_allocations; i++) {
+    const size_t size = absl::Uniform<size_t>(rand, 1, 1 << 20);
+    allocations.emplace_back(new char[size]);
+  }
+
+  // Collect stats into our string, avoiding repeated resize.
+  std::string stats;
+  stats.resize(1 << 18);
+  for (auto s : state) {
+    MallocExtension_Internal_GetStats(&stats);
+  }
+}
+BENCHMARK(BM_get_stats_internal)
+    ->Range(1, 1 << 20)
+    ->Unit(benchmark::kMillisecond);
+
+static void BM_get_stats_pageheap_lock(benchmark::State& state) {
+  std::vector<std::unique_ptr<char[]>> allocations;
+  const int num_allocations = state.range(0);
+  allocations.reserve(num_allocations);
+
+  // Perform randomly sized allocations which will be kept live whilst we
+  // collect stats, allowing us to observe the impact of heap size on the time
+  // taken to collect stats.
+  absl::BitGen rand;
+  for (int i = 0; i < num_allocations; i++) {
+    const size_t size = absl::Uniform<size_t>(rand, 1, 1 << 20);
+    allocations.emplace_back(new char[size]);
+  }
+
+  // Create a background thread which busy-loops calling
+  // MallocExtension::GetStats().
+  absl::Notification done;
+  std::atomic<size_t> counter = 0;
+  std::thread stats_thread([&] {
+    while (!done.HasBeenNotified()) {
+      const std::string stats = MallocExtension::GetStats();
+      counter.fetch_add(1, std::memory_order_seq_cst);
+      benchmark::DoNotOptimize(stats);
+    }
+  });
+
+  // Repeatedly acquire and release pageheap_lock.
+  // Since nothing else is going on in this thread, the average time to acquire
+  // and release is a reasonable approximation to how long the stats_thread
+  // holds pageheap lock.
+  for (auto s : state) {
+    absl::Duration elapsed;
+    const size_t start_counter = counter;
+    size_t end_counter;
+    do {
+      const auto start_ts = absl::Now();
+      tcmalloc_internal::pageheap_lock.Lock();
+      tcmalloc_internal::pageheap_lock.Unlock();
+      const auto end_ts = absl::Now();
+      elapsed = end_ts - start_ts;
+      end_counter = counter;
+    } while (start_counter == end_counter);
+
+    state.SetIterationTime(absl::ToDoubleSeconds(elapsed) /
+                           (end_counter - start_counter));
+  }
+
+  // End the background stats_thread.
+  done.Notify();
+  stats_thread.join();
+}
+BENCHMARK(BM_get_stats_pageheap_lock)
+    ->Range(1, 1 << 20)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+
+static void BM_get_stats_pbtxt_internal(benchmark::State& state) {
+  if (&MallocExtension_Internal_GetStatsInPbtxt == nullptr) {
+    // Sanitizer builds don't provide this function.
+    return;
+  }
+  std::vector<std::unique_ptr<char[]>> allocations;
+  const int num_allocations = state.range(0);
+  allocations.reserve(num_allocations);
+
+  // Perform randomly sized allocations which will be kept live whilst we
+  // collect stats, allowing us to observe the impact of heap size on the time
+  // taken to collect stats.
+  absl::BitGen rand;
+  for (int i = 0; i < num_allocations; i++) {
+    const size_t size = absl::Uniform<size_t>(rand, 1, 1 << 20);
+    allocations.emplace_back(new char[size]);
+  }
+
+  // Collect stats into our buffer. We use 3MiB -- same as
+  // net_http_handlers::MalloczHandler
+  std::vector<char> buf(3 << 20);
+  for (auto s : state) {
+    int sz = MallocExtension_Internal_GetStatsInPbtxt(&buf[0], buf.size());
+    benchmark::DoNotOptimize(sz);
+  }
+}
+BENCHMARK(BM_get_stats_pbtxt_internal)
+    ->Range(1, 1 << 20)
+    ->Unit(benchmark::kMillisecond);
+
+static void BM_get_stats_pbtxt_pageheap_lock(benchmark::State& state) {
+  if (&MallocExtension_Internal_GetStatsInPbtxt == nullptr) {
+    // Sanitizer builds don't provide this function.
+    return;
+  }
+  std::vector<std::unique_ptr<char[]>> allocations;
+  const int num_allocations = state.range(0);
+  allocations.reserve(num_allocations);
+
+  // Perform randomly sized allocations which will be kept live whilst we
+  // collect stats, allowing us to observe the impact of heap size on the time
+  // taken to collect stats.
+  absl::BitGen rand;
+  for (int i = 0; i < num_allocations; i++) {
+    const size_t size = absl::Uniform<size_t>(rand, 1, 1 << 20);
+    allocations.emplace_back(new char[size]);
+  }
+
+  // Create a background thread which busy-loops calling
+  // MallocExtension::GetStats().
+  absl::Notification done;
+  std::atomic<size_t> counter = 0;
+  std::thread stats_thread([&] {
+    std::vector<char> buf(3 << 20);
+    while (!done.HasBeenNotified()) {
+      const int sz =
+          MallocExtension_Internal_GetStatsInPbtxt(&buf[0], buf.size());
+      counter.fetch_add(1, std::memory_order_seq_cst);
+      benchmark::DoNotOptimize(sz);
+    }
+  });
+
+  // Repeatedly acquire and release pageheap_lock.
+  // Since nothing else is going on in this thread, the average time to acquire
+  // and release is a reasonable approximation to how long the stats_thread
+  // holds pageheap lock.
+  for (auto s : state) {
+    absl::Duration elapsed;
+    const size_t start_counter = counter;
+    size_t end_counter;
+    do {
+      const auto start_ts = absl::Now();
+      tcmalloc_internal::pageheap_lock.Lock();
+      tcmalloc_internal::pageheap_lock.Unlock();
+      const auto end_ts = absl::Now();
+      elapsed = end_ts - start_ts;
+      end_counter = counter;
+    } while (start_counter == end_counter);
+
+    state.SetIterationTime(absl::ToDoubleSeconds(elapsed) /
+                           (end_counter - start_counter));
+  }
+
+  // End the background stats_thread.
+  done.Notify();
+  stats_thread.join();
+}
+BENCHMARK(BM_get_stats_pbtxt_pageheap_lock)
+    ->Range(1, 1 << 20)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+
+static void BM_get_heap_profile(benchmark::State& state) {
+  std::vector<std::unique_ptr<char[]>> allocations;
+  const int num_allocations = state.range(0);
+  allocations.reserve(num_allocations);
+
+  // Perform randomly sized allocations which will be kept live while we collect
+  // the heap profile.
+  absl::BitGen rand;
+  for (int i = 0; i < num_allocations; i++) {
+    const size_t size = absl::Uniform<size_t>(rand, 1, 1 << 20);
+    allocations.emplace_back(new char[size]);
+  }
+
+  for (auto s : state) {
+    MallocExtension::SnapshotCurrent(ProfileType::kHeap);
+  }
+}
+BENCHMARK(BM_get_heap_profile)->Range(1, 1 << 20);
+
+static void BM_get_heap_profile_while_allocating(benchmark::State& state) {
+  std::vector<std::unique_ptr<char[]>> allocations;
+  const int num_allocations = state.range(0);
+  allocations.reserve(num_allocations);
+
+  // Perform randomly sized allocations which will be kept live while we collect
+  // heap profile.
+  absl::BitGen rand;
+  for (int i = 0; i < num_allocations; i++) {
+    const size_t size = absl::Uniform<size_t>(rand, 1, 1 << 20);
+    allocations.emplace_back(new char[size]);
+  }
+
+  // Create a background thread that keeps collecting the heap profile.
+  absl::Notification done;
+  std::thread profile_thread([&] {
+    while (!done.HasBeenNotified()) {
+      MallocExtension::SnapshotCurrent(ProfileType::kHeap);
+    }
+  });
+
+  // Allocate large objects (> 256KB). This would hit the pageheap lock and
+  // its performance would be affected by how long the profile_thread holds the
+  // pageheap lock.
+  for (auto s : state) {
+    std::vector<std::unique_ptr<char[]>> large_allocations;
+    large_allocations.reserve(100);
+    for (int i = 0; i < 100; i++) {
+      const size_t size = absl::Uniform<size_t>(rand, 256 * 1024, 1 << 20);
+      large_allocations.emplace_back(new char[size]);
+    }
+  }
+
+  // End the background profile_thread.
+  done.Notify();
+  profile_thread.join();
+}
+BENCHMARK(BM_get_heap_profile_while_allocating)->Range(1, 1 << 18);
 
 }  // namespace
 }  // namespace tcmalloc

@@ -40,9 +40,9 @@ inline constexpr Length kPagesPerHugePage =
 
 // A single aligned huge page.
 struct HugePage {
-  void *start_addr() const {
+  void* start_addr() const {
     ASSERT(pn <= kMaxPageNumber);
-    return reinterpret_cast<void *>(pn << kHugePageShift);
+    return reinterpret_cast<void*>(pn << kHugePageShift);
   }
 
   PageId first_page() const {
@@ -55,6 +55,11 @@ struct HugePage {
     return pn;
   }
 
+  template <typename H>
+  friend H AbslHashValue(H h, const HugePage& p) {
+    return H::combine(std::move(h), p.pn);
+  }
+
   static constexpr uintptr_t kMaxPageNumber =
       std::numeric_limits<uintptr_t>::max() >> kHugePageShift;
 
@@ -62,8 +67,6 @@ struct HugePage {
 };
 
 struct HugeLength {
-  size_t n;
-
   constexpr HugeLength() : n(0) {}
   explicit HugeLength(double x) : n(ceil(x)) { ASSERT(x >= 0); }
   constexpr size_t raw_num() const { return n; }
@@ -77,10 +80,38 @@ struct HugeLength {
   // It is possible to have a HugeLength that corresponds to more
   // bytes than can be addressed (i.e. > size_t.)  Check for that.
   bool overflows() const;
+  static constexpr HugeLength min() {
+    return HugeLength(static_cast<size_t>(0));
+  }
+  static constexpr HugeLength max() {
+    return HugeLength(static_cast<size_t>(HugePage::kMaxPageNumber));
+  }
 
  private:
+  size_t n;
+
   explicit constexpr HugeLength(size_t x) : n(x) {}
   friend constexpr HugeLength NHugePages(size_t n);
+  friend HugeLength& operator++(HugeLength&);
+  friend HugeLength& operator--(HugeLength&);
+  friend constexpr bool operator<(HugeLength, HugeLength);
+  friend constexpr bool operator>(HugeLength, HugeLength);
+  friend constexpr bool operator<=(HugeLength, HugeLength);
+  friend constexpr bool operator>=(HugeLength, HugeLength);
+  friend constexpr bool operator==(HugeLength, HugeLength);
+  friend constexpr bool operator!=(HugeLength, HugeLength);
+  friend constexpr size_t operator/(HugeLength, HugeLength);
+  friend constexpr HugeLength operator%(HugeLength, HugeLength);
+  friend constexpr HugeLength operator*(HugeLength, size_t);
+  friend HugeLength& operator*=(HugeLength&, size_t);
+  friend constexpr HugeLength operator/(HugeLength, size_t);
+  friend constexpr HugePage operator+(HugePage lhs, HugeLength rhs);
+  friend constexpr HugePage operator-(HugePage lhs, HugeLength rhs);
+  friend HugePage& operator+=(HugePage& lhs, HugeLength rhs);
+  friend constexpr HugeLength operator+(HugeLength lhs, HugeLength rhs);
+  friend HugeLength& operator+=(HugeLength& lhs, HugeLength rhs);
+  friend constexpr HugeLength operator-(HugeLength lhs, HugeLength rhs);
+  friend HugeLength& operator-=(HugeLength& lhs, HugeLength rhs);
 };
 
 // Literal constructors (made explicit to avoid accidental uses when
@@ -100,18 +131,18 @@ inline constexpr HugeLength HLFromPages(Length pages) {
                     kPagesPerHugePage);
 }
 
-inline HugeLength &operator++(HugeLength &len) {  // NOLINT(runtime/references)
+inline HugeLength& operator++(HugeLength& len) {  // NOLINT(runtime/references)
   len.n++;
   return len;
 }
 
-inline HugePage &operator++(HugePage &p) {  // NOLINT(runtime/references)
+inline HugePage& operator++(HugePage& p) {  // NOLINT(runtime/references)
   ASSERT(p.pn + 1 <= HugePage::kMaxPageNumber);
   p.pn++;
   return p;
 }
 
-inline HugeLength &operator--(HugeLength &len) {  // NOLINT(runtime/references)
+inline HugeLength& operator--(HugeLength& len) {  // NOLINT(runtime/references)
   ASSERT(len.n >= 1);
   len.n--;
   return len;
@@ -191,7 +222,7 @@ inline constexpr HugeLength operator/(HugeLength lhs, size_t rhs) {
   return NHugePages(lhs.n / rhs);
 }
 
-inline HugeLength &operator*=(HugeLength &lhs, size_t rhs) {
+inline HugeLength& operator*=(HugeLength& lhs, size_t rhs) {
   lhs.n *= rhs;
   return lhs;
 }
@@ -222,7 +253,7 @@ inline constexpr HugeLength operator-(HugePage lhs, HugePage rhs) {
   return ASSERT(lhs.pn >= rhs.pn), NHugePages(lhs.pn - rhs.pn);
 }
 
-inline HugePage &operator+=(HugePage &lhs, HugeLength rhs) {
+inline HugePage& operator+=(HugePage& lhs, HugeLength rhs) {
   ASSERT(lhs.pn + rhs.n <= HugePage::kMaxPageNumber);
   lhs.pn += rhs.n;
   return lhs;
@@ -233,7 +264,7 @@ inline constexpr HugeLength operator+(HugeLength lhs, HugeLength rhs) {
   return NHugePages(lhs.n + rhs.n);
 }
 
-inline HugeLength &operator+=(HugeLength &lhs, HugeLength rhs) {
+inline HugeLength& operator+=(HugeLength& lhs, HugeLength rhs) {
   lhs.n += rhs.n;
   return lhs;
 }
@@ -243,7 +274,7 @@ inline constexpr HugeLength operator-(HugeLength lhs, HugeLength rhs) {
   return ASSERT(lhs.n >= rhs.n), NHugePages(lhs.n - rhs.n);
 }
 
-inline HugeLength &operator-=(HugeLength &lhs, HugeLength rhs) {
+inline HugeLength& operator-=(HugeLength& lhs, HugeLength rhs) {
   ASSERT(lhs.n >= rhs.n);
   lhs.n -= rhs.n;
   return lhs;
@@ -253,7 +284,7 @@ inline bool HugeLength::overflows() const {
   return *this > HLFromBytes(std::numeric_limits<size_t>::max());
 }
 
-inline void PrintTo(const HugeLength &n, ::std::ostream *os) {
+inline void PrintTo(const HugeLength& n, ::std::ostream* os) {
   *os << n.raw_num() << "hps";
 }
 
@@ -263,16 +294,16 @@ inline HugePage HugePageContaining(PageId p) {
 }
 
 TCMALLOC_ATTRIBUTE_CONST
-inline HugePage HugePageContaining(void *p) {
+inline HugePage HugePageContaining(void* p) {
   return HugePageContaining(PageIdContaining(p));
 }
 
 // A set of contiguous huge pages.
 struct HugeRange {
-  void *start_addr() const { return first.start_addr(); }
-  void *end_addr() const { return (first + n).start_addr(); }
+  void* start_addr() const { return first.start_addr(); }
+  void* end_addr() const { return (first + n).start_addr(); }
   size_t byte_len() const {
-    return static_cast<char *>(end_addr()) - static_cast<char *>(start_addr());
+    return static_cast<char*>(end_addr()) - static_cast<char*>(start_addr());
   }
 
   // Assume any range starting at 0 is bogus.
@@ -285,7 +316,7 @@ struct HugeRange {
   HugePage operator[](HugeLength i) const { return first + i; }
 
   template <typename H>
-  friend H AbslHashValue(H h, const HugeRange &r) {
+  friend H AbslHashValue(H h, const HugeRange& r) {
     return H::combine(std::move(h), r.start().start_addr(), r.len().raw_num());
   }
 

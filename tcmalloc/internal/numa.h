@@ -19,6 +19,9 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#include <array>
+#include <cstdint>
+
 #include "absl/functional/function_ref.h"
 #include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/percpu.h"
@@ -126,31 +129,25 @@ class NumaTopology {
   uint64_t GetPartitionNodes(int partition) const;
 
  private:
-  // Maps from CPU number (plus kNumaCpuFudge) to NUMA partition.
-  size_t cpu_to_scaled_partition_[CPU_SETSIZE + kNumaCpuFudge] = {0};
   // Maps from NUMA partition to a bitmap of NUMA nodes within the partition.
   uint64_t partition_to_nodes_[NumPartitions] = {0};
   // Indicates whether NUMA awareness is available & enabled.
   bool numa_aware_ = false;
   // Desired memory binding behavior.
   NumaBindMode bind_mode_ = NumaBindMode::kAdvisory;
+  // Maps from CPU number (plus kNumaCpuFudge) to NUMA partition.
+  // If NUMA awareness is not enabled, allocate array of 0 size to not waste
+  // space, we shouldn't access it. Place it as the last member, so that ASan
+  // warns about any unintentional accesses. This is checked by the
+  // static_assert in Init.
+  static constexpr size_t kCpuMapSize =
+      NumPartitions > 1 ? CPU_SETSIZE + kNumaCpuFudge : 0;
+  std::array<size_t, kCpuMapSize> cpu_to_scaled_partition_ = {};
 };
 
 // Opens a /sys/devices/system/node/nodeX/cpulist file for read only access &
 // returns the file descriptor.
 int OpenSysfsCpulist(size_t node);
-
-// Parse a CPU list in the format used by
-// /sys/devices/system/node/nodeX/cpulist files - that is, individual CPU
-// numbers or ranges in the format <start>-<end> inclusive all joined by comma
-// characters.
-//
-// The read function is expected to operate much like the read syscall. It
-// should read up to `count` bytes into `buf` and return the number of bytes
-// actually read. If an error occurs during reading it should return -1 with
-// errno set to an appropriate error code.
-cpu_set_t ParseCpulist(
-    absl::FunctionRef<ssize_t(char *buf, size_t count)> read);
 
 // Initialize the data members of a NumaTopology<> instance.
 //
@@ -163,7 +160,7 @@ cpu_set_t ParseCpulist(
 // Returns true if we're actually NUMA aware; i.e. if we have CPUs mapped to
 // multiple partitions.
 bool InitNumaTopology(size_t cpu_to_scaled_partition[CPU_SETSIZE],
-                      uint64_t *partition_to_nodes, NumaBindMode *bind_mode,
+                      uint64_t* partition_to_nodes, NumaBindMode* bind_mode,
                       size_t num_partitions, size_t scale_by,
                       absl::FunctionRef<int(size_t)> open_node_cpulist);
 
@@ -174,8 +171,13 @@ inline size_t NodeToPartition(const size_t node, const size_t num_partitions) {
 
 template <size_t NumPartitions, size_t ScaleBy>
 inline void NumaTopology<NumPartitions, ScaleBy>::Init() {
+  static_assert(offsetof(NumaTopology, cpu_to_scaled_partition_) +
+                        sizeof(cpu_to_scaled_partition_) +
+                        sizeof(*cpu_to_scaled_partition_.data()) >=
+                    sizeof(NumaTopology),
+                "cpu_to_scaled_partition_ is not the last field");
   numa_aware_ =
-      InitNumaTopology(cpu_to_scaled_partition_, partition_to_nodes_,
+      InitNumaTopology(cpu_to_scaled_partition_.data(), partition_to_nodes_,
                        &bind_mode_, NumPartitions, ScaleBy, OpenSysfsCpulist);
 }
 
@@ -183,7 +185,7 @@ template <size_t NumPartitions, size_t ScaleBy>
 inline void NumaTopology<NumPartitions, ScaleBy>::InitForTest(
     absl::FunctionRef<int(size_t)> open_node_cpulist) {
   numa_aware_ =
-      InitNumaTopology(cpu_to_scaled_partition_, partition_to_nodes_,
+      InitNumaTopology(cpu_to_scaled_partition_.data(), partition_to_nodes_,
                        &bind_mode_, NumPartitions, ScaleBy, open_node_cpulist);
 }
 

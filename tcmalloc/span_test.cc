@@ -14,8 +14,11 @@
 
 #include "tcmalloc/span.h"
 
+#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -33,30 +36,29 @@ namespace {
 
 class RawSpan {
  public:
-  void Init(size_t cl) {
-    size_t size = Static::sizemap().class_to_size(cl);
-    auto npages = Length(Static::sizemap().class_to_pages(cl));
+  void Init(size_t size_class) {
+    size_t size = tc_globals.sizemap().class_to_size(size_class);
+    auto npages = Length(tc_globals.sizemap().class_to_pages(size_class));
     size_t objects_per_span = npages.in_bytes() / size;
 
-    void *mem;
-    int res = posix_memalign(&mem, kPageSize, npages.in_bytes());
+    int res = posix_memalign(&mem_, kPageSize, npages.in_bytes());
     CHECK_CONDITION(res == 0);
-    span_.set_first_page(PageIdContaining(mem));
-    span_.set_num_pages(npages);
+    span_.Init(PageIdContaining(mem_), npages);
     span_.BuildFreelist(size, objects_per_span, nullptr, 0);
   }
 
-  ~RawSpan() { free(span_.start_address()); }
+  ~RawSpan() { free(mem_); }
 
-  Span &span() { return span_; }
+  Span& span() { return span_; }
 
  private:
+  void* mem_ = nullptr;
   Span span_;
 };
 
 class SpanTest : public testing::TestWithParam<size_t> {
  protected:
-  size_t cl_;
+  size_t size_class_;
   size_t size_;
   size_t npages_;
   size_t batch_size_;
@@ -65,30 +67,30 @@ class SpanTest : public testing::TestWithParam<size_t> {
 
  private:
   void SetUp() override {
-    cl_ = GetParam();
-    size_ = Static::sizemap().class_to_size(cl_);
+    size_class_ = GetParam();
+    size_ = tc_globals.sizemap().class_to_size(size_class_);
     if (size_ == 0) {
       GTEST_SKIP() << "Skipping empty size class.";
     }
 
-    npages_ = Static::sizemap().class_to_pages(cl_);
-    batch_size_ = Static::sizemap().num_objects_to_move(cl_);
+    npages_ = tc_globals.sizemap().class_to_pages(size_class_);
+    batch_size_ = tc_globals.sizemap().num_objects_to_move(size_class_);
     objects_per_span_ = npages_ * kPageSize / size_;
 
-    raw_span_.Init(cl_);
+    raw_span_.Init(size_class_);
   }
 
   void TearDown() override {}
 };
 
 TEST_P(SpanTest, FreelistBasic) {
-  Span &span_ = raw_span_.span();
+  Span& span_ = raw_span_.span();
 
   EXPECT_FALSE(span_.FreelistEmpty(size_));
-  void *batch[kMaxObjectsToMove];
+  void* batch[kMaxObjectsToMove];
   size_t popped = 0;
   size_t want = 1;
-  char *start = static_cast<char *>(span_.start_address());
+  char* start = static_cast<char*>(span_.start_address());
   std::vector<bool> objects(objects_per_span_);
   for (size_t x = 0; x < 2; ++x) {
     // Pop all objects in batches of varying size and ensure that we've got
@@ -96,10 +98,15 @@ TEST_P(SpanTest, FreelistBasic) {
     for (;;) {
       size_t n = span_.FreelistPopBatch(batch, want, size_);
       popped += n;
+      EXPECT_NEAR(
+          span_.Fragmentation(size_),
+          static_cast<double>(objects_per_span_) / static_cast<double>(popped) -
+              1.,
+          1e-5);
       EXPECT_EQ(span_.FreelistEmpty(size_), popped == objects_per_span_);
       for (size_t i = 0; i < n; ++i) {
-        void *p = batch[i];
-        uintptr_t off = reinterpret_cast<char *>(p) - start;
+        void* p = batch[i];
+        uintptr_t off = reinterpret_cast<char*>(p) - start;
         EXPECT_LT(off, span_.bytes_in_span());
         EXPECT_EQ(off % size_, 0);
         size_t idx = off / size_;
@@ -137,17 +144,17 @@ TEST_P(SpanTest, FreelistBasic) {
 }
 
 TEST_P(SpanTest, FreelistRandomized) {
-  Span &span_ = raw_span_.span();
+  Span& span_ = raw_span_.span();
 
-  char *start = static_cast<char *>(span_.start_address());
+  char* start = static_cast<char*>(span_.start_address());
 
   // Do a bunch of random pushes/pops with random batch size.
   absl::BitGen rng;
-  absl::flat_hash_set<void *> objects;
-  void *batch[kMaxObjectsToMove];
+  absl::flat_hash_set<void*> objects;
+  void* batch[kMaxObjectsToMove];
   for (size_t x = 0; x < 10000; ++x) {
     if (!objects.empty() && absl::Bernoulli(rng, 1.0 / 2)) {
-      void *p = *objects.begin();
+      void* p = *objects.begin();
       if (span_.FreelistPush(p, size_)) {
         objects.erase(objects.begin());
       } else {
@@ -177,8 +184,8 @@ TEST_P(SpanTest, FreelistRandomized) {
   }
   // Check that we have collected all objects.
   EXPECT_EQ(objects.size(), objects_per_span_);
-  for (void *p : objects) {
-    uintptr_t off = reinterpret_cast<char *>(p) - start;
+  for (void* p : objects) {
+    uintptr_t off = reinterpret_cast<char*>(p) - start;
     EXPECT_LT(off, span_.bytes_in_span());
     EXPECT_EQ(off % size_, 0);
   }

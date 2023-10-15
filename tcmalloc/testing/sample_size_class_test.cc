@@ -13,13 +13,14 @@
 // limitations under the License.
 
 #include <stddef.h>
-#include <stdint.h>
 #include <stdlib.h>
+
+#include <new>
 
 #include "gtest/gtest.h"
 #include "tcmalloc/internal/linked_list.h"
-#include "tcmalloc/internal/logging.h"
 #include "tcmalloc/malloc_extension.h"
+#include "tcmalloc/testing/testutil.h"
 
 // This tests that heap profiling works properly in the face of allocations
 // being rounded up to the next size class.
@@ -29,13 +30,10 @@
 // Suppose client code calls malloc(17) many times.  tcmalloc will round these
 // allocations up to the next size class, which happens to be 32 bytes.
 //
-// A bug arises if the probability that tcmalloc samples a given allocation is
-// a function of the requested size (17), rather than the allocated size (32).
-//
 // As part of processing profiles, we reverse the effect of sampling to get an
 // approximation of the actual total usage; if we do this reversal based on
-// allocated size, but the sampling was actually done on requested size, we will
-// under-count these allocation.
+// allocated size, but the sampling was actually done on requested size (as
+// happens in practice), we will under-count these allocation.
 
 namespace tcmalloc {
 namespace {
@@ -71,17 +69,19 @@ TEST(SampleSizeClassTest, Main) {
   // new kRequestSize.
   const size_t kRequestSize = 17;
   const size_t kActualSize = 32;
-  void* p = malloc(kRequestSize);
-  EXPECT_EQ(kActualSize, MallocExtension::GetAllocatedSize(p));
-  free(p);
+  {
+    ScopedNeverSample never_sample;  // sampling can affect reported sizes
+    void* p = malloc(kRequestSize);
+    EXPECT_EQ(kActualSize, MallocExtension::GetAllocatedSize(p));
+    free(p);
+  }
 
   // Allocate a large amount of data.  We construct a linked list with the
-  // pointers to avoid having to allocate auxillary data for keeping track of
+  // pointers to avoid having to allocate auxiliary data for keeping track of
   // all of the allocations.
   const double start = HeapProfileReport(kActualSize);
   size_t allocated = 0;
   tcmalloc_internal::LinkedList objs;
-  objs.Init();
   while (allocated < 128 * 1024 * 1024) {
     // We must use the return value from malloc, otherwise the compiler may
     // optimize out the call altogether!

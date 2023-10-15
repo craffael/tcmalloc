@@ -14,21 +14,27 @@
 
 #include "tcmalloc/huge_region.h"
 
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <string.h>
 
 #include <algorithm>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/memory/memory.h"
 #include "absl/random/random.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "tcmalloc/common.h"
+#include "tcmalloc/huge_cache.h"
 #include "tcmalloc/huge_pages.h"
 #include "tcmalloc/internal/logging.h"
+#include "tcmalloc/pages.h"
 #include "tcmalloc/stats.h"
 
 namespace tcmalloc {
@@ -36,43 +42,36 @@ namespace tcmalloc_internal {
 namespace {
 
 using testing::NiceMock;
-using testing::StrictMock;
+using testing::Return;
 
 class HugeRegionTest : public ::testing::Test {
  protected:
   HugeRegionTest()
-      :  // an unlikely magic page
-        p_(HugePageContaining(reinterpret_cast<void *>(0x1faced200000))),
-        region_({p_, region_.size()}, MockUnback) {
+      : mock_(std::make_unique<NiceMock<MockBackingInterface>>()),
+        // an unlikely magic page
+        p_(HugePageContaining(reinterpret_cast<void*>(0x1faced200000))),
+        region_({p_, region_.size()}, *mock_) {
     // we usually don't care about backing calls, unless testing that
     // specifically.
-    mock_ = absl::make_unique<NiceMock<MockBackingInterface>>();
   }
 
   ~HugeRegionTest() override { mock_.reset(nullptr); }
 
-  // This is wordy, but necessary for mocking:
-  class BackingInterface {
+  class MockBackingInterface : public MemoryModifyFunction {
    public:
-    virtual void Unback(void *p, size_t len) = 0;
-    virtual ~BackingInterface() {}
+    MOCK_METHOD(bool, Unback, (void* p, size_t len), ());
+
+    bool operator()(void* p, size_t len) override { return Unback(p, len); }
   };
 
-  class MockBackingInterface : public BackingInterface {
-   public:
-    MOCK_METHOD2(Unback, void(void *p, size_t len));
-  };
-
-  static std::unique_ptr<MockBackingInterface> mock_;
-
-  static void MockUnback(void *p, size_t len) { mock_->Unback(p, len); }
+  std::unique_ptr<MockBackingInterface> mock_;
 
   void CheckMock() { testing::Mock::VerifyAndClearExpectations(mock_.get()); }
 
-  void ExpectUnback(HugeRange r) {
-    void *ptr = r.start_addr();
+  void ExpectUnback(HugeRange r, bool success = true) {
+    void* ptr = r.start_addr();
     size_t bytes = r.byte_len();
-    EXPECT_CALL(*mock_, Unback(ptr, bytes)).Times(1);
+    EXPECT_CALL(*mock_, Unback(ptr, bytes)).WillOnce(Return(success));
   }
 
   struct Alloc {
@@ -112,7 +111,7 @@ class HugeRegionTest : public ::testing::Test {
     return Allocate(n, &from_released);
   }
 
-  Alloc Allocate(Length n, bool *from_released) {
+  Alloc Allocate(Length n, bool* from_released) {
     Alloc ret;
     CHECK_CONDITION(region_.MaybeGet(n, &ret.p, from_released));
     ret.n = n;
@@ -131,8 +130,6 @@ class HugeRegionTest : public ::testing::Test {
     region_.Put(a.p, a.n, true);
   }
 };
-
-std::unique_ptr<HugeRegionTest::MockBackingInterface> HugeRegionTest::mock_;
 
 TEST_F(HugeRegionTest, Basic) {
   Length total;
@@ -195,8 +192,31 @@ TEST_F(HugeRegionTest, ReqsBacking) {
   }
 }
 
+TEST_F(HugeRegionTest, ReleaseFrac) {
+  const Length n = kPagesPerHugePage;
+  bool from_released;
+  auto a = Allocate(n * 20, &from_released);
+  EXPECT_TRUE(from_released);
+
+  Delete(a);
+  ExpectUnback({p_ + NHugePages(0), NHugePages(2)});
+  EXPECT_EQ(NHugePages(2), region_.Release(/*release_fraction=*/0.1));
+  CheckMock();
+
+  ExpectUnback({p_ + NHugePages(2), NHugePages(1)});
+  EXPECT_EQ(NHugePages(1), region_.Release(/*release_fraction=*/0.1));
+  CheckMock();
+
+  ExpectUnback({p_ + NHugePages(3), NHugePages(8)});
+  EXPECT_EQ(NHugePages(8), region_.Release(/*release_fraction=*/0.5));
+  CheckMock();
+
+  ExpectUnback({p_ + NHugePages(11), NHugePages(9)});
+  EXPECT_EQ(NHugePages(9), region_.Release(/*release_fraction=*/1.0));
+  CheckMock();
+}
+
 TEST_F(HugeRegionTest, Release) {
-  mock_ = absl::make_unique<StrictMock<MockBackingInterface>>();
   const Length n = kPagesPerHugePage;
   bool from_released;
   auto a = Allocate(n * 4 - Length(1), &from_released);
@@ -220,18 +240,18 @@ TEST_F(HugeRegionTest, Release) {
   // overlap with others.
   Delete(b);
   ExpectUnback({p_ + NHugePages(4), NHugePages(2)});
-  EXPECT_EQ(NHugePages(2), region_.Release());
+  EXPECT_EQ(NHugePages(2), region_.Release(/*release_fraction=*/1.0));
   CheckMock();
 
   // Now we're on exact boundaries so we should unback the whole range.
   Delete(d);
   ExpectUnback({p_ + NHugePages(12), NHugePages(2)});
-  EXPECT_EQ(NHugePages(2), region_.Release());
+  EXPECT_EQ(NHugePages(2), region_.Release(/*release_fraction=*/1.0));
   CheckMock();
 
   Delete(a);
   ExpectUnback({p_ + NHugePages(0), NHugePages(4)});
-  EXPECT_EQ(NHugePages(4), region_.Release());
+  EXPECT_EQ(NHugePages(4), region_.Release(/*release_fraction=*/1.0));
   CheckMock();
 
   // Should work just as well with aggressive Put():
@@ -248,7 +268,6 @@ TEST_F(HugeRegionTest, Release) {
 }
 
 TEST_F(HugeRegionTest, Reback) {
-  mock_ = absl::make_unique<StrictMock<MockBackingInterface>>();
   const Length n = kPagesPerHugePage / 4;
   bool from_released;
   // Even in back/unback cycles we should still call the functions
@@ -279,10 +298,10 @@ TEST_F(HugeRegionTest, Stats) {
   const Length kLen = region_.size().in_pages();
   const size_t kBytes = kLen.in_bytes();
   struct Helper {
-    static void Stat(const Region &region, std::vector<Length> *small_backed,
-                     std::vector<Length> *small_unbacked, LargeSpanStats *large,
-                     BackingStats *stats, double *avg_age_backed,
-                     double *avg_age_unbacked) {
+    static void Stat(const Region& region, std::vector<Length>* small_backed,
+                     std::vector<Length>* small_unbacked, LargeSpanStats* large,
+                     BackingStats* stats, double* avg_age_backed,
+                     double* avg_age_unbacked) {
       SmallSpanStats small;
       *large = LargeSpanStats();
       PageAgeHistograms ages(absl::base_internal::CycleClock::Now());
@@ -429,6 +448,8 @@ TEST_F(HugeRegionTest, StatBreakdown) {
   Alloc d = Allocate(n - (n / 5) - Length(1));
   // This unbacks the middle 2 hugepages, but not the beginning or
   // trailing region
+  ExpectUnback(
+      HugeRange::Make(HugePageContaining(b.p) + NHugePages(1), NHugePages(2)));
   DeleteUnback(b);
   Delete(c);
   SmallSpanStats small;
@@ -450,21 +471,61 @@ TEST_F(HugeRegionTest, StatBreakdown) {
   Delete(d);
 }
 
-static void NilUnback(void *p, size_t bytes) {}
+TEST_F(HugeRegionTest, StatBreakdownReleaseFailure) {
+  const Length n = kPagesPerHugePage;
+  Alloc a = Allocate(n / 4);
+  Alloc b = Allocate(n * 3 + n / 3);
+  Alloc c = Allocate((n - n / 3 - n / 4) + n * 5 + n / 5);
+  Alloc d = Allocate(n - (n / 5) - Length(1));
+  // This tries to unback the middle 2 hugepages, but not the beginning or
+  // trailing region, but fails.
+  ExpectUnback(
+      HugeRange::Make(HugePageContaining(b.p) + NHugePages(1), NHugePages(2)),
+      /*success=*/false);
+  DeleteUnback(b);
+  Delete(c);
+  SmallSpanStats small;
+  LargeSpanStats large;
+  region_.AddSpanStats(&small, &large, nullptr);
+  // Backed beginning of hugepage A/B/C/D and the unbacked tail of allocation.
+  EXPECT_EQ(2, large.spans);
+  // Tail end of A's page, all of B, all of C.
+  EXPECT_EQ((n - n / 4) + n * 8 + (n / 5), large.normal_pages);
+  // The above fill up 10 total pages.
+  EXPECT_EQ((Region::size().raw_num() - 10) * n, large.returned_pages);
+  EXPECT_EQ(1, small.normal_length[1]);
 
-class HugeRegionSetTest : public testing::Test {
+  EXPECT_EQ(Length(1) + large.normal_pages + large.returned_pages +
+                region_.used_pages(),
+            Region::size().in_pages());
+  Delete(a);
+  Delete(d);
+}
+
+class NilUnback final : public MemoryModifyFunction {
+ public:
+  bool operator()(void* p, size_t bytes) override { return true; }
+};
+
+class HugeRegionSetTest
+    : public ::testing::TestWithParam<HugeRegionUsageOption> {
  protected:
   typedef HugeRegion Region;
 
-  HugeRegionSetTest() { next_ = HugePageContaining(nullptr); }
+  HugeRegionSetTest() : set_(/*use_huge_region_more_often=*/GetParam()) {
+    next_ = HugePageContaining(nullptr);
+  }
 
   std::unique_ptr<Region> GetRegion() {
     // These regions are backed by "real" memory, but we don't touch it.
-    std::unique_ptr<Region> r(new Region({next_, Region::size()}, NilUnback));
+    std::unique_ptr<Region> r(new Region({next_, Region::size()}, nil_unback_));
     next_ += Region::size();
     return r;
   }
 
+  bool UseHugeRegionMoreOften() const { return set_.UseHugeRegionMoreOften(); }
+
+  NilUnback nil_unback_;
   HugeRegionSet<Region> set_;
   HugePage next_;
 
@@ -474,7 +535,43 @@ class HugeRegionSetTest : public testing::Test {
   };
 };
 
-TEST_F(HugeRegionSetTest, Set) {
+TEST_P(HugeRegionSetTest, Release) {
+  absl::BitGen rng;
+  PageId p;
+  constexpr Length kSize = kPagesPerHugePage + Length(1);
+  bool from_released;
+  ASSERT_FALSE(set_.MaybeGet(Length(1), &p, &from_released));
+  auto r1 = GetRegion();
+  set_.Contribute(r1.get());
+
+  std::vector<Alloc> allocs;
+
+  while (set_.MaybeGet(kSize, &p, &from_released)) {
+    allocs.push_back({p, kSize});
+  }
+  BackingStats stats = set_.stats();
+  EXPECT_EQ(stats.unmapped_bytes, 0);
+
+  for (auto a : allocs) {
+    ASSERT_TRUE(set_.MaybePut(a.p, a.n));
+  }
+
+  stats = set_.stats();
+  EXPECT_EQ(stats.unmapped_bytes,
+            UseHugeRegionMoreOften() ? 0 : stats.system_bytes);
+  // All the huge pages in the region would be free, but backed, when
+  // huge-region-more-often feature is enabled.
+  EXPECT_EQ(r1->free_backed().raw_num(),
+            UseHugeRegionMoreOften() ? Region::size().raw_num() : 0);
+  Length released = set_.ReleasePages(/*release_fraction=*/1.0);
+  stats = set_.stats();
+  EXPECT_EQ(released.in_bytes(),
+            UseHugeRegionMoreOften() ? stats.system_bytes : 0);
+  EXPECT_EQ(r1->free_backed().in_bytes(), 0);
+  EXPECT_EQ(stats.unmapped_bytes, stats.system_bytes);
+}
+
+TEST_P(HugeRegionSetTest, Set) {
   absl::BitGen rng;
   PageId p;
   constexpr Length kSize = kPagesPerHugePage + Length(1);
@@ -521,9 +618,9 @@ TEST_F(HugeRegionSetTest, Set) {
   // Random traffic should have defragmented our allocations into full
   // and empty regions, and released the empty ones.  Annoyingly, we don't
   // know which region is which, so we have to do a bit of silliness:
-  std::vector<Region *> regions = {r1.get(), r2.get(), r3.get(), r4.get()};
+  std::vector<Region*> regions = {r1.get(), r2.get(), r3.get(), r4.get()};
   std::sort(regions.begin(), regions.end(),
-            [](const Region *a, const Region *b) -> bool {
+            [](const Region* a, const Region* b) -> bool {
               return a->used_pages() > b->used_pages();
             });
 
@@ -538,10 +635,21 @@ TEST_F(HugeRegionSetTest, Set) {
   EXPECT_LE(Region::size().in_pages().raw_num() * 0.9,
             regions[1]->used_pages().raw_num());
   // and last two "empty" (ish.)
-  EXPECT_LE(Region::size().in_pages().raw_num() * 0.9,
-            regions[2]->unmapped_pages().raw_num());
-  EXPECT_LE(Region::size().in_pages().raw_num() * 0.9,
-            regions[3]->unmapped_pages().raw_num());
+  if (UseHugeRegionMoreOften()) {
+    EXPECT_EQ(regions[2]->unmapped_pages().raw_num(), 0);
+    EXPECT_EQ(regions[3]->unmapped_pages().raw_num(), 0);
+    EXPECT_GT(regions[2]->free_backed().raw_num(),
+              Region::size().raw_num() * 0.9);
+    EXPECT_GT(regions[3]->free_backed().raw_num(),
+              Region::size().raw_num() * 0.9);
+  } else {
+    EXPECT_LE(Region::size().in_pages().raw_num() * 0.9,
+              regions[2]->unmapped_pages().raw_num());
+    EXPECT_LE(Region::size().in_pages().raw_num() * 0.9,
+              regions[3]->unmapped_pages().raw_num());
+    EXPECT_EQ(regions[2]->free_backed().raw_num(), 0);
+    EXPECT_EQ(regions[3]->free_backed().raw_num(), 0);
+  }
 
   // Check the stats line up.
   auto stats = set_.stats();
@@ -559,6 +667,11 @@ TEST_F(HugeRegionSetTest, Set) {
   set_.Print(&out);
   printf("%s\n", &buf[0]);
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    All, HugeRegionSetTest,
+    testing::Values(HugeRegionUsageOption::kDefault,
+                    HugeRegionUsageOption::kUseForAllLargeAllocs));
 
 }  // namespace
 }  // namespace tcmalloc_internal

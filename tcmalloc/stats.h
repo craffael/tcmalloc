@@ -18,6 +18,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <algorithm>
+
+#include "absl/base/attributes.h"
 #include "absl/base/internal/cycleclock.h"
 #include "absl/strings/string_view.h"
 #include "tcmalloc/common.h"
@@ -47,8 +50,6 @@ inline BackingStats operator+(BackingStats lhs, BackingStats rhs) {
 }
 
 struct SmallSpanStats {
-  constexpr SmallSpanStats() = default;
-
   // For each free list of small spans, the length (in spans) of the
   // normal and returned free lists for that size.
   int64_t normal_length[kMaxPages.raw_num()] = {0};
@@ -102,7 +103,7 @@ class PageAgeHistograms {
   void Print(const char* label, Printer* out) const;
 
   static constexpr size_t kNumBuckets = 7;
-  static constexpr size_t kNumSizes = 64;
+  static constexpr size_t kNumSizes = kMaxPages.raw_num();
 
   static constexpr Length kLargeSize = Length(kNumSizes);
   class Histogram {
@@ -195,8 +196,7 @@ class PageAllocInfo {
   struct Counts;
 
  public:
-  // If log_fd >= 0, dump a page trace to it as record events come in.
-  PageAllocInfo(const char* label, int log_fd);
+  PageAllocInfo(const char* label);
 
   // Subclasses are responsible for calling these methods when
   // the relevant actions occur
@@ -253,15 +253,6 @@ class PageAllocInfo {
 
   const int64_t baseline_ticks_{absl::base_internal::CycleClock::Now()};
   const double freq_{absl::base_internal::CycleClock::Frequency()};
-
-  // State for page trace logging.
-  const int fd_;
-  uint64_t last_ms_{0};
-  void Write(uint64_t when, uint8_t what, PageId p, Length n);
-  bool log_on() const { return fd_ >= 0; }
-  void LogAlloc(int64_t when, PageId p, Length n) { Write(when, 0, p, n); }
-  void LogFree(int64_t when, PageId p, Length n) { Write(when, 1, p, n); }
-  void LogRelease(int64_t when, Length n) { Write(when, 2, PageId{0}, n); }
 };
 
 }  // namespace tcmalloc_internal

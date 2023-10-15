@@ -21,14 +21,18 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "absl/base/attributes.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/numeric/bits.h"
 #include "tcmalloc/common.h"
 #include "tcmalloc/internal/linked_list.h"
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/internal/optimization.h"
+#include "tcmalloc/internal/prefetch.h"
 #include "tcmalloc/internal/range_tracker.h"
+#include "tcmalloc/internal/sampled_allocation.h"
 #include "tcmalloc/pages.h"
+#include "tcmalloc/sizemap.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
 namespace tcmalloc {
@@ -44,6 +48,19 @@ inline constexpr size_t kBitmapMinObjectSize = kPageSize / 64;
 // by N we multiply by M = kBitmapScalingDenominator / N and round the resulting
 // value.
 inline constexpr size_t kBitmapScalingDenominator = 65536;
+
+enum AccessDensityPrediction {
+  // Predict that the span would be sparsely-accessed.
+  kSparse = 0,
+  // Predict that the span would be densely-accessed.
+  kDense = 1,
+  kPredictionCounts
+};
+
+struct SpanAllocInfo {
+  size_t objects_per_span;
+  AccessDensityPrediction density;
+};
 
 // Information kept for a span (a contiguous run of pages).
 //
@@ -77,10 +94,6 @@ class Span : public SpanList::Elem {
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
   static void Delete(Span* span) ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
 
-  // Remove this from the linked list in which it resides.
-  // REQUIRES: this span is on some list.
-  void RemoveFromList();
-
   // locations used to track what list a span resides on.
   enum Location {
     IN_USE,                // not on PageHeap lists
@@ -95,27 +108,32 @@ class Span : public SpanList::Elem {
   // There is one-to-one correspondence between a sampled allocation and a span.
   // ---------------------------------------------------------------------------
 
-  // Mark this span as sampling allocation at the stack. Sets state to SAMPLED.
-  void Sample(StackTrace* stack) ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
+  // Mark this span in the "SAMPLED" state. It will store the corresponding
+  // sampled allocation and update some global counters on the total size of
+  // sampled allocations.
+  void Sample(SampledAllocation* sampled_allocation);
 
-  // Unmark this span as sampling an allocation.
-  // Returns stack trace previously passed to Sample,
-  // or nullptr if this is a non-sampling span.
+  // Unmark this span from its "SAMPLED" state. It will return the sampled
+  // allocation previously passed to Span::Sample() or nullptr if this is a
+  // non-sampling span. It will also update the global counters on the total
+  // size of sampled allocations.
   // REQUIRES: this is a SAMPLED span.
-  StackTrace* Unsample() ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
+  SampledAllocation* Unsample();
 
-  // Returns stack for the sampled allocation.
+  // Returns the sampled allocation of the span.
   // pageheap_lock is not required, but caller either needs to hold the lock or
   // ensure by some other means that the sampling state can't be changed
   // concurrently.
   // REQUIRES: this is a SAMPLED span.
-  StackTrace* sampled_stack() const;
+  SampledAllocation* sampled_allocation() const;
 
   // Is it a sampling span?
   // For debug checks. pageheap_lock is not required, but caller needs to ensure
   // that sampling state can't be changed concurrently.
   bool sampled() const;
 
+  bool donated() const { return is_donated_; }
+  void set_donated(bool value) { is_donated_ = value; }
   // ---------------------------------------------------------------------------
   // Span memory range.
   // ---------------------------------------------------------------------------
@@ -130,7 +148,7 @@ class Span : public SpanList::Elem {
   void set_first_page(PageId p);
 
   // Returns start address of the span.
-  void* start_address() const;
+  ABSL_ATTRIBUTE_RETURNS_NONNULL void* start_address() const;
 
   // Returns number of pages in the span.
   Length num_pages() const;
@@ -155,10 +173,17 @@ class Span : public SpanList::Elem {
 
   // Returns internal fragmentation of the span.
   // REQUIRES: this is a SMALL_OBJECT span.
-  double Fragmentation() const;
+  double Fragmentation(size_t object_size) const;
 
   // Returns number of objects allocated in the span.
-  uint16_t Allocated() const { return allocated_; }
+  uint16_t Allocated() const {
+    return allocated_.load(std::memory_order_relaxed);
+  }
+
+  // Returns index of the non-empty list to which this span belongs to.
+  uint8_t nonempty_index() const { return nonempty_index_; }
+  // Records an index of the non-empty list associated with this span.
+  void set_nonempty_index(uint8_t index) { nonempty_index_ = index; }
 
   // ---------------------------------------------------------------------------
   // Freelist management.
@@ -175,14 +200,17 @@ class Span : public SpanList::Elem {
   // to hold available objects.
   bool FreelistEmpty(size_t size) const;
 
-  // Pushes ptr onto freelist unless the freelist becomes full,
-  // in which case just return false.
+  // Pushes ptr onto freelist unless the freelist becomes full, in which case
+  // just return false.
+  //
+  // If the freelist becomes full, we do not push the object onto the freelist.
   bool FreelistPush(void* ptr, size_t size) {
-    ASSERT(allocated_ > 0);
-    if (ABSL_PREDICT_FALSE(allocated_ == 1)) {
+    const auto allocated = allocated_.load(std::memory_order_relaxed);
+    ASSERT(allocated > 0);
+    if (ABSL_PREDICT_FALSE(allocated == 1)) {
       return false;
     }
-    allocated_--;
+    allocated_.store(allocated - 1, std::memory_order_relaxed);
     // Bitmaps are used to record object availability when there are fewer than
     // 64 objects in a span.
     if (ABSL_PREDICT_FALSE(size >= kBitmapMinObjectSize)) {
@@ -214,16 +242,9 @@ class Span : public SpanList::Elem {
   // Prefetch cacheline containing most important span information.
   void Prefetch();
 
-  // Returns whether we use an intrusive linked list to represent the Span.
-  // Above the minimum object size for using a bit map, all objects fit in the
-  // bit map.
-  static bool IsIntrusive(size_t size, size_t count) {
-    return !(size >= kBitmapMinObjectSize || count <= kCacheSize);
-  }
-
- private:
   static constexpr size_t kCacheSize = 4;
 
+ private:
   // See the comment on freelist organization in cc file.
   typedef uint16_t ObjIdx;
   static constexpr ObjIdx kListEnd = -1;
@@ -235,7 +256,7 @@ class Span : public SpanList::Elem {
   // are used here, but the flag could potentially hurt performance in other
   // cases so it is not enabled by default. For more information, please
   // look at b/35680381 and cl/199502226.
-  uint16_t allocated_;  // Number of non-free objects
+  std::atomic<uint16_t> allocated_;  // Number of non-free objects
   uint16_t embed_count_;
   // For available objects stored as a compressed linked list, the index of
   // the first object in recorded in freelist_. When a bitmap is used to
@@ -247,8 +268,12 @@ class Span : public SpanList::Elem {
     uint16_t reciprocal_;
   };
   uint8_t cache_size_;
+  uint8_t nonempty_index_ : 4;  // The nonempty_ list index for this span.
   uint8_t location_ : 2;  // Is the span on a freelist, and if so, which?
   uint8_t sampled_ : 1;   // Sampled object?
+  // Has this span allocation resulted in a donation to the filler in the page
+  // heap? This is used by page heap to compute abandoned pages.
+  uint8_t is_donated_ : 1;
 
   union {
     // Used only for spans in CentralFreeList (SMALL_OBJECT state).
@@ -261,7 +286,7 @@ class Span : public SpanList::Elem {
     Bitmap<64> bitmap_{};
 
     // Used only for sampled spans (SAMPLED state).
-    StackTrace* sampled_stack_;
+    SampledAllocation* sampled_allocation_;
 
     // Used only for spans in PageHeap
     // (ON_NORMAL_FREELIST or ON_RETURNED_FREELIST state).
@@ -346,7 +371,7 @@ Span::ObjIdx* Span::IdxToPtrSized(ObjIdx idx, size_t size) const {
 template <Span::Align align>
 Span::ObjIdx Span::PtrToIdxSized(void* ptr, size_t size) const {
   // Object index is an offset from span start divided by a power-of-two.
-  // The divisors are choosen so that
+  // The divisors are chosen so that
   // (1) objects are aligned on the divisor,
   // (2) index fits into 16 bits and
   // (3) the index of the beginning of all objects is strictly less than
@@ -364,7 +389,7 @@ Span::ObjIdx Span::PtrToIdxSized(void* ptr, size_t size) const {
     // pointer.
     ASSERT(PageIdContaining(ptr) == first_page_);
     ASSERT(num_pages_ == Length(1));
-    off = (p & (kPageSize - 1)) / kAlignment;
+    off = (p & (kPageSize - 1)) / static_cast<size_t>(kAlignment);
   } else {
     off = (p - first_page_.start_uintptr()) / SizeMap::kMultiPageAlignment;
   }
@@ -428,7 +453,8 @@ size_t Span::FreelistPopBatchSized(void** __restrict batch, size_t N,
     freelist_ = current;
     embed_count_ = size / sizeof(ObjIdx) - 1;
   }
-  allocated_ += result;
+  allocated_.store(allocated_.load(std::memory_order_relaxed) + result,
+                   std::memory_order_relaxed);
   return result;
 }
 
@@ -449,7 +475,8 @@ bool Span::FreelistPushSized(void* ptr, size_t size) {
       ASSERT(num_pages_ == Length(1));
       host = reinterpret_cast<ObjIdx*>(
           (reinterpret_cast<uintptr_t>(ptr) & ~(kPageSize - 1)) +
-          static_cast<uintptr_t>(freelist_) * kAlignment);
+          static_cast<uintptr_t>(freelist_) *
+              static_cast<uintptr_t>(kAlignment));
       ASSERT(PtrToIdx(host, size) == freelist_);
     } else {
       host = IdxToPtrSized<align>(freelist_, size);
@@ -505,7 +532,7 @@ bool Span::BitmapFreelistPush(void* ptr, size_t size) {
 #ifndef NDEBUG
   size_t after = bitmap_.CountBits(0, 64);
   ASSERT(before + 1 == after);
-  ASSERT(allocated_ == embed_count_ - after);
+  ASSERT(allocated_.load(std::memory_order_relaxed) == embed_count_ - after);
 #endif
   return true;
 }
@@ -518,9 +545,9 @@ inline void Span::set_location(Location loc) {
   location_ = static_cast<uint64_t>(loc);
 }
 
-inline StackTrace* Span::sampled_stack() const {
+inline SampledAllocation* Span::sampled_allocation() const {
   ASSERT(sampled_);
-  return sampled_stack_;
+  return sampled_allocation_;
 }
 
 inline bool Span::sampled() const { return sampled_; }
@@ -531,9 +558,15 @@ inline PageId Span::last_page() const {
   return first_page_ + num_pages_ - Length(1);
 }
 
-inline void Span::set_first_page(PageId p) { first_page_ = p; }
+inline void Span::set_first_page(PageId p) {
+  ASSERT(p > PageId{0});
+  first_page_ = p;
+}
 
-inline void* Span::start_address() const { return first_page_.start_addr(); }
+inline void* Span::start_address() const {
+  ASSERT(first_page_ > PageId{0});
+  return first_page_.start_addr();
+}
 
 inline Length Span::num_pages() const { return num_pages_; }
 
@@ -557,8 +590,6 @@ inline bool Span::FreelistEmpty(size_t size) const {
   }
 }
 
-inline void Span::RemoveFromList() { SpanList::Elem::remove(); }
-
 inline void Span::Prefetch() {
   // The first 16 bytes of a Span are the next and previous pointers
   // for when it is stored in a linked list. Since the sizeof(Span) is
@@ -566,21 +597,12 @@ inline void Span::Prefetch() {
   // the first 16-bytes or the last 16-bytes in a different cache line.
   // Prefetch the cacheline that contains the most frequestly accessed
   // data by offseting into the middle of the Span.
-#if defined(__GNUC__)
-#if __WORDSIZE == 32
-  // The Span fits in one cache line, so simply prefetch the base pointer.
-  static_assert(sizeof(Span) == 32, "Update span prefetch offset");
-  __builtin_prefetch(this, 0, 3);
-#else
-  // The Span can occupy two cache lines, so prefetch the cacheline with the
-  // most frequently accessed parts of the Span.
   static_assert(sizeof(Span) == 48, "Update span prefetch offset");
-  __builtin_prefetch(&this->allocated_, 0, 3);
-#endif
-#endif
+  PrefetchT0(&this->allocated_);
 }
 
 inline void Span::Init(PageId p, Length n) {
+  ASSERT(p > PageId{0});
 #ifndef NDEBUG
   // In debug mode we have additional checking of our list ops; these must be
   // initialized.
@@ -590,6 +612,8 @@ inline void Span::Init(PageId p, Length n) {
   num_pages_ = n;
   location_ = IN_USE;
   sampled_ = 0;
+  nonempty_index_ = 0;
+  is_donated_ = 0;
 }
 
 }  // namespace tcmalloc_internal

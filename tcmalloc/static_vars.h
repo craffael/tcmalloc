@@ -26,18 +26,25 @@
 #include "absl/base/attributes.h"
 #include "absl/base/optimization.h"
 #include "absl/base/thread_annotations.h"
+#include "tcmalloc/allocation_sample.h"
 #include "tcmalloc/arena.h"
 #include "tcmalloc/central_freelist.h"
 #include "tcmalloc/common.h"
+#include "tcmalloc/deallocation_profiler.h"
 #include "tcmalloc/guarded_page_allocator.h"
 #include "tcmalloc/internal/atomic_stats_counter.h"
+#include "tcmalloc/internal/explicitly_constructed.h"
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/internal/numa.h"
 #include "tcmalloc/internal/percpu.h"
+#include "tcmalloc/internal/sampled_allocation.h"
+#include "tcmalloc/internal/sampled_allocation_recorder.h"
+#include "tcmalloc/internal/stacktrace_filter.h"
 #include "tcmalloc/page_allocator.h"
-#include "tcmalloc/page_heap.h"
 #include "tcmalloc/page_heap_allocator.h"
 #include "tcmalloc/peak_heap_tracker.h"
+#include "tcmalloc/sampled_allocation_allocator.h"
+#include "tcmalloc/sizemap.h"
 #include "tcmalloc/span.h"
 #include "tcmalloc/stack_trace_table.h"
 #include "tcmalloc/transfer_cache.h"
@@ -46,12 +53,18 @@ GOOGLE_MALLOC_SECTION_BEGIN
 namespace tcmalloc {
 namespace tcmalloc_internal {
 
-class CPUCache;
+class CpuCache;
 class PageMap;
 class ThreadCache;
 
-class Static {
+using SampledAllocationRecorder =
+    ::tcmalloc::tcmalloc_internal::SampleRecorder<SampledAllocation,
+                                                  SampledAllocationAllocator>;
+
+class Static final {
  public:
+  constexpr Static() = default;
+
   // True if InitIfNecessary() has run to completion.
   static bool IsInited();
   // Must be called before calling any of the accessors below.
@@ -73,7 +86,7 @@ class Static {
 
   static SizeMap& sizemap() { return sizemap_; }
 
-  static CPUCache& cpu_cache() { return cpu_cache_; }
+  static CpuCache& cpu_cache() { return cpu_cache_; }
 
   static PeakHeapTracker& peak_heap_tracker() { return peak_heap_tracker_; }
 
@@ -98,44 +111,70 @@ class Static {
     return guardedpage_allocator_;
   }
 
-  static PageHeapAllocator<Span>& span_allocator() { return span_allocator_; }
+  static StackTraceFilter& stacktrace_filter() { return stacktrace_filter_; }
 
-  static PageHeapAllocator<StackTrace>& stacktrace_allocator() {
-    return stacktrace_allocator_;
+  static SampledAllocationAllocator& sampledallocation_allocator() {
+    return sampledallocation_allocator_;
   }
+
+  static PageHeapAllocator<Span>& span_allocator() { return span_allocator_; }
 
   static PageHeapAllocator<ThreadCache>& threadcache_allocator() {
     return threadcache_allocator_;
   }
 
-  // State kept for sampled allocations (/heapz support). The StatsCounter is
-  // only written while holding pageheap_lock, so writes can safely use
-  // LossyAdd and reads do not require locking.
-  static SpanList sampled_objects_ ABSL_GUARDED_BY(pageheap_lock);
+  static SampledAllocationRecorder& sampled_allocation_recorder() {
+    return sampled_allocation_recorder_.get_mutable();
+  }
+
+  // State kept for sampled allocations (/heapz support). No pageheap_lock
+  // required when reading/writing the counters.
   ABSL_CONST_INIT static tcmalloc_internal::StatsCounter sampled_objects_size_;
+  // sampled_internal_fragmentation estimates the amount of memory overhead from
+  // allocation sizes being rounded up to size class/page boundaries.
+  ABSL_CONST_INIT static tcmalloc_internal::StatsCounter
+      sampled_internal_fragmentation_;
+  // total_sampled_count_ tracks the total number of allocations that are
+  // sampled.
+  ABSL_CONST_INIT static tcmalloc_internal::StatsCounter total_sampled_count_;
 
-  static PageHeapAllocator<StackTraceTable::Bucket>& bucket_allocator() {
-    return bucket_allocator_;
+  ABSL_CONST_INIT static AllocationSampleList allocation_samples;
+
+  ABSL_CONST_INIT static deallocationz::DeallocationProfilerList
+      deallocation_samples;
+
+  // MallocHook::AllocHandle is a simple 64-bit int, and is not dependent on
+  // other data.
+  ABSL_CONST_INIT static std::atomic<AllocHandle>
+      sampled_alloc_handle_generator;
+
+  static PageHeapAllocator<StackTraceTable::LinkedSample>&
+  linked_sample_allocator() {
+    return linked_sample_allocator_;
   }
 
-  static bool ABSL_ATTRIBUTE_ALWAYS_INLINE CPUCacheActive() {
-    return cpu_cache_active_;
+  static bool ABSL_ATTRIBUTE_ALWAYS_INLINE CpuCacheActive() {
+    return cpu_cache_active_.load(std::memory_order_acquire);
   }
-  static void ActivateCPUCache() { cpu_cache_active_ = true; }
+  static void ActivateCpuCache() {
+    cpu_cache_active_.store(true, std::memory_order_release);
+  }
 
   static bool ABSL_ATTRIBUTE_ALWAYS_INLINE IsOnFastPath() {
     return
-#ifndef TCMALLOC_DEPRECATED_PERTHREAD
+        // These boolean operations do not require short-circuiting from &&.
+        // Bitwise AND of booleans triggers -Wbitwise-instead-of-logical, as
+        // this can be a common source of bugs.  Suppress this by casting to
+        // int first.
+
         // When the per-cpu cache is enabled, and the thread's current cpu
         // variable is initialized we will try to allocate from the per-cpu
         // cache. If something fails, we bail out to the full malloc.
         // Checking the current cpu variable here allows us to remove it from
         // the fast-path, since we will fall back to the slow path until this
         // variable is initialized.
-        CPUCacheActive() & subtle::percpu::IsFastNoInit();
-#else
-        !CPUCacheActive();
-#endif
+        static_cast<int>(CpuCacheActive()) &
+        static_cast<int>(subtle::percpu::IsFastNoInit());
   }
 
   static size_t metadata_bytes() ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
@@ -158,16 +197,19 @@ class Static {
 
   ABSL_CONST_INIT static Arena arena_;
   static SizeMap sizemap_;
-  ABSL_CONST_INIT static TransferCacheManager transfer_cache_;
+  TCMALLOC_ATTRIBUTE_NO_DESTROY ABSL_CONST_INIT static TransferCacheManager
+      transfer_cache_;
   ABSL_CONST_INIT static ShardedTransferCacheManager sharded_transfer_cache_;
-  static CPUCache cpu_cache_;
+  static CpuCache cpu_cache_;
   ABSL_CONST_INIT static GuardedPageAllocator guardedpage_allocator_;
+  ABSL_CONST_INIT static StackTraceFilter stacktrace_filter_;
+  static SampledAllocationAllocator sampledallocation_allocator_;
   static PageHeapAllocator<Span> span_allocator_;
-  static PageHeapAllocator<StackTrace> stacktrace_allocator_;
   static PageHeapAllocator<ThreadCache> threadcache_allocator_;
-  static PageHeapAllocator<StackTraceTable::Bucket> bucket_allocator_;
+  static PageHeapAllocator<StackTraceTable::LinkedSample>
+      linked_sample_allocator_;
   ABSL_CONST_INIT static std::atomic<bool> inited_;
-  static bool cpu_cache_active_;
+  ABSL_CONST_INIT static std::atomic<bool> cpu_cache_active_;
   ABSL_CONST_INIT static PeakHeapTracker peak_heap_tracker_;
   ABSL_CONST_INIT static NumaTopology<kNumaPartitions, kNumBaseClasses>
       numa_topology_;
@@ -184,7 +226,14 @@ class Static {
 
   static PageAllocatorStorage page_allocator_;
   static PageMap pagemap_;
+
+  // Manages sampled allocations and allows iteration over samples free from
+  // the global pageheap_lock.
+  static ExplicitlyConstructed<SampledAllocationRecorder>
+      sampled_allocation_recorder_;
 };
+
+ABSL_CONST_INIT extern Static tc_globals;
 
 inline bool Static::IsInited() {
   return inited_.load(std::memory_order_acquire);

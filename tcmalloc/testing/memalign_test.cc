@@ -25,16 +25,13 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <unistd.h>
 
 #include <iostream>
-#include <memory>
 #include <vector>
 
 #include "gtest/gtest.h"
 #include "absl/random/random.h"
-#include "benchmark/benchmark.h"
-#include "tcmalloc/testing/testutil.h"
+#include "tcmalloc/internal/page_size.h"
 
 namespace tcmalloc {
 namespace {
@@ -179,17 +176,21 @@ TEST(MemalignTest, AlignedAlloc) {
   free(p_small);
 }
 
-#ifndef NDEBUG
-TEST(MemalignTest, AlignedAllocDeathTest) {
+TEST(MemalignTest, AlignedAllocUnsupportedAlignment) {
   // Hide invalid alignment from -Wnon-power-of-two-alignment.
   volatile size_t alignment = 0;
-  EXPECT_DEATH(benchmark::DoNotOptimize(aligned_alloc(alignment, 1)), "");
+  errno = 0;
+  EXPECT_EQ(aligned_alloc(alignment, 1), nullptr);
+  EXPECT_EQ(errno, EINVAL);
   alignment = sizeof(void*) + 1;
-  EXPECT_DEATH(benchmark::DoNotOptimize(aligned_alloc(alignment, 1)), "");
+  errno = 0;
+  EXPECT_EQ(aligned_alloc(alignment, 1), nullptr);
+  EXPECT_EQ(errno, EINVAL);
   alignment = 4097;
-  EXPECT_DEATH(benchmark::DoNotOptimize(aligned_alloc(alignment, 1)), "");
+  errno = 0;
+  EXPECT_EQ(aligned_alloc(alignment, 1), nullptr);
+  EXPECT_EQ(errno, EINVAL);
 }
-#endif
 
 TEST(MemalignTest, Memalign) {
   // Try allocating data with a bunch of alignments and sizes
@@ -260,7 +261,7 @@ TEST(MemalignTest, PosixMemalignFailure) {
 }
 
 TEST(MemalignTest, valloc) {
-  const int pagesize = getpagesize();
+  const int pagesize = tcmalloc_internal::GetPageSize();
 
   for (int s = 0; s != -1; s = NextSize(s)) {
     void* p = valloc(s);
@@ -273,7 +274,7 @@ TEST(MemalignTest, valloc) {
 
 #if defined(__BIONIC__) || defined(__GLIBC__) || defined(__NEWLIB__)
 TEST(MemalignTest, pvalloc) {
-  const int pagesize = getpagesize();
+  const int pagesize = tcmalloc_internal::GetPageSize();
 
   for (int s = 0; s != -1; s = NextSize(s)) {
     void* p = pvalloc(s);

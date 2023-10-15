@@ -14,10 +14,15 @@
 
 #include <unistd.h>
 
+#include <algorithm>
+
 #include "absl/base/internal/spinlock.h"
 #include "benchmark/benchmark.h"
+#include "tcmalloc/common.h"
 #include "tcmalloc/guarded_page_allocator.h"
+#include "tcmalloc/internal/allocation_guard.h"
 #include "tcmalloc/internal/logging.h"
+#include "tcmalloc/internal/page_size.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
 namespace tcmalloc {
@@ -29,21 +34,21 @@ static constexpr size_t kMaxGpaPages = GuardedPageAllocator::kGpaMaxPages;
 // Size of pages used by GuardedPageAllocator.
 static size_t PageSize() {
   static const size_t page_size =
-      std::max(kPageSize, static_cast<size_t>(getpagesize()));
+      std::max(kPageSize, static_cast<size_t>(GetPageSize()));
   return page_size;
 }
 
 void BM_AllocDealloc(benchmark::State& state) {
   static GuardedPageAllocator* gpa = []() {
     auto gpa = new GuardedPageAllocator;
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    AllocationGuardSpinLockHolder h(&pageheap_lock);
     gpa->Init(kMaxGpaPages, kMaxGpaPages);
     gpa->AllowAllocations();
     return gpa;
   }();
   size_t alloc_size = state.range(0);
   for (auto _ : state) {
-    char* ptr = reinterpret_cast<char*>(gpa->Allocate(alloc_size, 0));
+    char* ptr = reinterpret_cast<char*>(gpa->Allocate(alloc_size, 0).alloc);
     CHECK_CONDITION(ptr != nullptr);
     ptr[0] = 'X';               // Page fault first page.
     ptr[alloc_size - 1] = 'X';  // Page fault last page.

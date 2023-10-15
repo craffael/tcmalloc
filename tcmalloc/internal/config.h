@@ -17,7 +17,8 @@
 
 #include <stddef.h>
 
-#include "absl/base/policy_checks.h"
+#include "absl/base/attributes.h"
+#include "absl/base/config.h"
 
 // TCMALLOC_HAVE_SCHED_GETCPU is defined when the system implements
 // sched_getcpu(3) as by glibc and it's imitators.
@@ -27,21 +28,32 @@
 #undef TCMALLOC_HAVE_SCHED_GETCPU
 #endif
 
+#if defined(__GLIBC__) && defined(__GLIBC_MINOR__)
+#define TCMALLOC_GLIBC_PREREQ(major, minor) \
+  ((__GLIBC__ * 100 + __GLIBC_MINOR__) >= ((major)*100 + (minor)))
+#else
+#define TCMALLOC_GLIBC_PREREQ(major, minor) 0
+#endif
+
 // TCMALLOC_HAVE_STRUCT_MALLINFO is defined when we know that the system has
 // `struct mallinfo` available.
 //
-// The FreeBSD libc, and subsequently macOS, does not provide the `mallopt`
-// interfaces. We know that bionic, glibc (and variants), newlib, and uclibc do
+// We know that bionic, glibc (and variants), newlib, and uclibc do
 // provide the `mallopt` interface.  The musl libc is known to not provide the
 // interface, nor does it provide a macro for checking.  As a result, we
 // conservatively state that `struct mallinfo` is only available on these
 // environments.
-#if !defined(OS_FREEBSD) && !defined(OS_MACOSX) &&                       \
-    (defined(__BIONIC__) || defined(__GLIBC__) || defined(__NEWLIB__) || \
-     defined(__UCLIBC__))
+#if defined(__BIONIC__) || defined(__GLIBC__) || defined(__NEWLIB__) || \
+    defined(__UCLIBC__)
 #define TCMALLOC_HAVE_STRUCT_MALLINFO 1
 #else
 #undef TCMALLOC_HAVE_STRUCT_MALLINFO
+#endif
+
+#if TCMALLOC_GLIBC_PREREQ(2, 33)
+#define TCMALLOC_HAVE_STRUCT_MALLINFO2 1
+#else
+#undef TCMALLOC_HAVE_STRUCT_MALLINFO2
 #endif
 
 // When possible, name the text section as google_malloc.  This macro should not
@@ -54,6 +66,14 @@
 #else
 #define GOOGLE_MALLOC_SECTION_BEGIN
 #define GOOGLE_MALLOC_SECTION_END
+#endif
+
+// TCMALLOC_ATTRIBUTE_NO_DESTROY is defined when clang::no_destroy attribute is
+// present.
+#if ABSL_HAVE_CPP_ATTRIBUTE(clang::no_destroy)
+#define TCMALLOC_ATTRIBUTE_NO_DESTROY [[clang::no_destroy]]
+#else
+#define TCMALLOC_ATTRIBUTE_NO_DESTROY
 #endif
 
 #if defined(__GNUC__) && !defined(__clang__)
@@ -71,6 +91,14 @@
 #if !defined(__x86_64__) && !defined(__ppc64__) && !defined(__arm__) && \
     !defined(__aarch64__) && !defined(__riscv)
 #error "Unsupported architecture."
+#endif
+
+#ifndef ABSL_IS_LITTLE_ENDIAN
+#error "TCMalloc only supports little endian architectures"
+#endif
+
+#ifndef __linux__
+#error "TCMalloc is only supported on Linux."
 #endif
 
 #if !defined(__cplusplus) || __cplusplus < 201703L
@@ -95,7 +123,7 @@ inline constexpr int kAddressBits =
     (sizeof(void*) < 8 ? (8 * sizeof(void*)) : 48);
 #elif defined __powerpc64__ && defined __linux__
 // Linux(4.12 and above) on powerpc64 supports 128TB user virtual address space
-// by default, and up to 512TB if user space opts in by specifing hint in mmap.
+// by default, and up to 512TB if user space opts in by specifying hint in mmap.
 // See comments in arch/powerpc/include/asm/processor.h
 // and arch/powerpc/mm/mmap.c.
 inline constexpr int kAddressBits =
@@ -107,7 +135,7 @@ inline constexpr int kAddressBits =
     (sizeof(void*) < 8 ? (8 * sizeof(void*)) : 48);
 #elif defined __riscv && defined __linux__
 inline constexpr int kAddressBits =
-    (sizeof(void *) < 8 ? (8 * sizeof(void *)) : 48);
+    (sizeof(void*) < 8 ? (8 * sizeof(void*)) : 48);
 #else
 inline constexpr int kAddressBits = 8 * sizeof(void*);
 #endif

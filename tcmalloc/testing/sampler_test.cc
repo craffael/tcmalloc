@@ -16,19 +16,14 @@
 
 #include "tcmalloc/sampler.h"
 
-#include <math.h>
 #include <stddef.h>
-#include <stdlib.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
-#include <new>
-#include <string>
-#include <type_traits>
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "absl/strings/str_cat.h"
 #include "tcmalloc/malloc_extension.h"
 #include "tcmalloc/testing/testutil.h"
 
@@ -43,13 +38,9 @@ class SamplerTest {
 
 namespace {
 
-// Note that these tests are stochastic.
-// This mean that the chance of correct code passing the test is,
-// in the case of 5 standard deviations:
-// kSigmas=5:    ~99.99994267%
-// in the case of 4 standard deviations:
-// kSigmas=4:    ~99.993666%
-static const double kSigmas = 4;
+// Note that these tests are stochastic. This means that the chance of correct
+// code passing the test is ~(1 - 10 ^ -kSigmas).
+static const double kSigmas = 6;
 static const size_t kSamplingInterval =
     MallocExtension::GetProfileSamplingRate();
 static const size_t kGuardedSamplingInterval = 100 * kSamplingInterval;
@@ -293,13 +284,15 @@ TEST(Sampler, LargeAndSmallAllocs_CombinedTest) {
 
 TEST(Sampler, TestShouldSampleGuardedAllocation) {
   ScopedGuardedSamplingRate s(kGuardedSamplingInterval);
+  ScopedImprovedGuardedSampling scoped_improved_guarded_sampling(false);
 
   Sampler sampler;
   SamplerTest::Init(&sampler, 1);
   int counter = 0;
   int num_iters = 10000;
   for (int i = 0; i < num_iters; i++) {
-    if (sampler.ShouldSampleGuardedAllocation()) {
+    if (sampler.ShouldSampleGuardedAllocation() ==
+        Profile::Sample::GuardedStatus::Required) {
       counter++;
     }
   }
@@ -307,6 +300,15 @@ TEST(Sampler, TestShouldSampleGuardedAllocation) {
       num_iters, counter, /*alloc_size=*/1,
       kGuardedSamplingInterval / kSamplingInterval);
   EXPECT_LE(fabs(sd), kSigmas);
+}
+
+TEST(Sampler, TestShouldSampleGuardedAllocationWithImprovedSampling) {
+  tcmalloc::MallocExtension::SetImprovedGuardedSampling(true);
+
+  Sampler sampler;
+  SamplerTest::Init(&sampler, 1);
+  EXPECT_EQ(sampler.ShouldSampleGuardedAllocation(),
+            Profile::Sample::GuardedStatus::Requested);
 }
 
 template <typename Body>
@@ -452,10 +454,10 @@ TEST(Sampler, stirring) {
   // dealing with Samplers that have same addresses, as we see when thread's TLS
   // areas are reused. b/117296263
 
-  absl::aligned_storage_t<sizeof(Sampler), alignof(Sampler)> place;
+  alignas(Sampler) char place[sizeof(Sampler)];
 
   DoCheckMean(kSamplingInterval, 1000, [&place]() {
-    Sampler* sampler = new (&place) Sampler;
+    Sampler* sampler = new (place) Sampler;
     // Sampler constructor just 0-initializes
     // everything. RecordAllocation really makes sampler initialize
     // itself.

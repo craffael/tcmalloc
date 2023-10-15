@@ -37,7 +37,7 @@ ABSL_ATTRIBUTE_NOINLINE void Sampler::Init(uint64_t seed) {
 
   // do_malloc comes here without having initialized statics, and
   // PickNextSamplingPoint uses data initialized in static vars.
-  Static::InitIfNecessary();
+  tc_globals.InitIfNecessary();
 
   // Initialize PRNG
   rnd_ = seed;
@@ -47,7 +47,7 @@ ABSL_ATTRIBUTE_NOINLINE void Sampler::Init(uint64_t seed) {
   }
   // Initialize counters
   true_bytes_until_sample_ = PickNextSamplingPoint();
-  if (Static::IsOnFastPath()) {
+  if (tc_globals.IsOnFastPath()) {
     bytes_until_sample_ = true_bytes_until_sample_;
     was_on_fast_path_ = true;
   } else {
@@ -138,7 +138,7 @@ size_t Sampler::RecordAllocationSlow(size_t k) {
     Init(reinterpret_cast<uintptr_t>(this) ^ global_seed);
     if (static_cast<size_t>(true_bytes_until_sample_) > k) {
       true_bytes_until_sample_ -= k;
-      if (Static::IsOnFastPath()) {
+      if (tc_globals.IsOnFastPath()) {
         bytes_until_sample_ -= k;
         was_on_fast_path_ = true;
       }
@@ -151,7 +151,7 @@ size_t Sampler::RecordAllocationSlow(size_t k) {
     // don't want to sample yet since true_bytes_until_sample_ >= k.
     true_bytes_until_sample_ -= k;
 
-    if (ABSL_PREDICT_TRUE(Static::IsOnFastPath())) {
+    if (ABSL_PREDICT_TRUE(tc_globals.IsOnFastPath())) {
       // We've moved from the slow path to the fast path since the last sampling
       // point was picked.
       bytes_until_sample_ = true_bytes_until_sample_;
@@ -168,19 +168,19 @@ size_t Sampler::RecordAllocationSlow(size_t k) {
   // Compute sampling weight (i.e. the number of bytes represented by this
   // sample in expectation).
   //
-  // Let k be the size of the allocation, p be the sample period
+  // Let k be the size of the allocation, T be the sample period
   // (sample_period_), and f the number of bytes after which we decided to
   // sample (either bytes_until_sample_ or true_bytes_until_sample_). On
-  // average, if we were to continue taking samples every p bytes, we would take
-  // (k - f) / p additional samples in this allocation, plus the one we are
-  // taking now, for 1 + (k - f) / p total samples. Multiplying by p, the mean
-  // number of bytes between samples, gives us a weight of p + k - f.
+  // average, if we were to continue taking samples every T bytes, we would take
+  // (k - f) / T additional samples in this allocation, plus the one we are
+  // taking now, for 1 + (k - f) / T total samples. Multiplying by T, the mean
+  // number of bytes between samples, gives us a weight of T + k - f.
   //
   size_t weight =
       sample_period_ + k -
       (was_on_fast_path_ ? bytes_until_sample_ : true_bytes_until_sample_);
   const auto point = PickNextSamplingPoint();
-  if (ABSL_PREDICT_TRUE(Static::IsOnFastPath())) {
+  if (ABSL_PREDICT_TRUE(tc_globals.IsOnFastPath())) {
     bytes_until_sample_ = point;
     true_bytes_until_sample_ = 0;
     was_on_fast_path_ = true;
@@ -192,13 +192,9 @@ size_t Sampler::RecordAllocationSlow(size_t k) {
   return GetSamplePeriod() <= 0 ? 0 : weight;
 }
 
-double AllocatedBytes(const StackTrace& stack, bool unsample) {
-  if (unsample) {
-    return static_cast<double>(stack.weight) * stack.allocated_size /
-           (stack.requested_size + 1);
-  } else {
-    return stack.allocated_size;
-  }
+double AllocatedBytes(const StackTrace& stack) {
+  return static_cast<double>(stack.weight) * stack.allocated_size /
+         (stack.requested_size + 1);
 }
 
 }  // namespace tcmalloc_internal

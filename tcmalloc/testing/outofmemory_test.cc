@@ -16,9 +16,9 @@
 // of memory causes other parts of the runtime to behave improperly.
 
 #include <stddef.h>
-#include <stdlib.h>
 
 #include <new>
+#include <string>
 
 #include "gtest/gtest.h"
 #include "tcmalloc/internal/config.h"
@@ -30,10 +30,16 @@ namespace {
 
 class OutOfMemoryTest : public ::testing::Test {
  public:
-  OutOfMemoryTest() { SetTestResourceLimit(); }
+  static const size_t kGiB = 1024 * 1024 * 1024;
+  OutOfMemoryTest() : limit_(ScopedResourceLimit(6 * kGiB)) {}
+
+ private:
+  ScopedResourceLimit limit_;
 };
 
 TEST_F(OutOfMemoryTest, TestUntilFailure) {
+  ScopedNeverSample never_sample;
+
   // Check that large allocations fail with NULL instead of crashing.
   static const size_t kIncrement = 100 << 20;
   static const size_t kMaxSize = ~static_cast<size_t>(0);
@@ -49,6 +55,8 @@ TEST_F(OutOfMemoryTest, TestUntilFailure) {
 }
 
 TEST_F(OutOfMemoryTest, SmallAllocs) {
+  ScopedNeverSample never_sample;
+
   // Check that large allocations fail with NULL instead of crashing.
   static constexpr size_t kSize = tcmalloc_internal::kHugePageSize / 2 - 1;
   void* list = nullptr;

@@ -15,6 +15,7 @@
 #ifndef TCMALLOC_INTERNAL_OPTIMIZATION_H_
 #define TCMALLOC_INTERNAL_OPTIMIZATION_H_
 
+#include "absl/base/attributes.h"
 #include "tcmalloc/internal/logging.h"
 
 // Our wrapper for __builtin_assume, allowing us to check the assumption on

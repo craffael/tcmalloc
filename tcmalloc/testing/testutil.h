@@ -18,6 +18,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <new>
+
 #include "benchmark/benchmark.h"
 #include "tcmalloc/internal/percpu.h"
 #include "tcmalloc/malloc_extension.h"
@@ -26,7 +28,8 @@
 // up trying to consume all of RAM+swap, and that can take quite some time.  By
 // limiting the address-space size we get sufficient coverage without blowing
 // out job limits.
-void SetTestResourceLimit();
+void SetTestResourceLimit(size_t limit);
+size_t GetTestResourceLimit();
 
 namespace tcmalloc {
 
@@ -36,6 +39,35 @@ inline void sized_delete(void* ptr, size_t size) {
 #else
   (void)size;
   ::operator delete(ptr);
+#endif
+}
+
+inline void sized_aligned_delete(void* ptr, size_t size,
+                                 std::align_val_t alignment) {
+#ifdef __cpp_sized_deallocation
+  ::operator delete(ptr, size, alignment);
+#else
+  (void)size;
+  ::operator delete(ptr, alignment);
+#endif
+}
+
+inline void sized_array_delete(void* ptr, size_t size) {
+#ifdef __cpp_sized_deallocation
+  ::operator delete[](ptr, size);
+#else
+  (void)size;
+  ::operator delete[](ptr);
+#endif
+}
+
+inline void sized_array_aligned_delete(void* ptr, size_t size,
+                                       std::align_val_t alignment) {
+#ifdef __cpp_sized_deallocation
+  ::operator delete[](ptr, size, alignment);
+#else
+  (void)size;
+  ::operator delete[](ptr, alignment);
 #endif
 }
 
@@ -71,6 +103,52 @@ class ScopedProfileSamplingRate {
   int64_t previous_;
 };
 
+// Sets custom background thread actions enable/disable when in scope.
+class ScopedBackgroundProcessActionsEnabled {
+ public:
+  explicit ScopedBackgroundProcessActionsEnabled(bool value)
+      : previous_(MallocExtension::GetBackgroundProcessActionsEnabled()) {
+    MallocExtension::SetBackgroundProcessActionsEnabled(value);
+  }
+
+  ~ScopedBackgroundProcessActionsEnabled() {
+    MallocExtension::SetBackgroundProcessActionsEnabled(previous_);
+  }
+
+ private:
+  bool previous_;
+};
+
+// Sets a custom background thread process sleep interval when in scope.
+class ScopedBackgroundProcessSleepInterval {
+ public:
+  explicit ScopedBackgroundProcessSleepInterval(absl::Duration limit)
+      : previous_(MallocExtension::GetBackgroundProcessSleepInterval()) {
+    MallocExtension::SetBackgroundProcessSleepInterval(limit);
+  }
+
+  ~ScopedBackgroundProcessSleepInterval() {
+    MallocExtension::SetBackgroundProcessSleepInterval(previous_);
+  }
+
+ private:
+  absl::Duration previous_;
+};
+
+// Sets a custom resource limit when in scope.
+class ScopedResourceLimit {
+ public:
+  explicit ScopedResourceLimit(size_t limit)
+      : previous_(GetTestResourceLimit()) {
+    SetTestResourceLimit(limit);
+  }
+
+  ~ScopedResourceLimit() { SetTestResourceLimit(previous_); }
+
+ private:
+  size_t previous_;
+};
+
 class ScopedGuardedSamplingRate {
  public:
   explicit ScopedGuardedSamplingRate(int64_t temporary_value)
@@ -86,6 +164,41 @@ class ScopedGuardedSamplingRate {
   int64_t previous_;
 };
 
+// Disables both guarded sampling and profile sampling while in scope.
+class ScopedNeverSample {
+ public:
+  ScopedNeverSample() : guarded_sampling_rate_(-1), profile_sampling_rate_(0) {}
+
+ private:
+  ScopedGuardedSamplingRate guarded_sampling_rate_;
+  ScopedProfileSamplingRate profile_sampling_rate_;
+};
+
+// Enables both guarded sampling and profile sampling for all allocations while
+// in scope.
+class ScopedAlwaysSample {
+ public:
+  // See b/201336703: guarded_sampling_rate==0 means every sampled allocation
+  // is guarded.
+  ScopedAlwaysSample() : guarded_sampling_rate_(0), profile_sampling_rate_(1) {}
+
+ private:
+  ScopedGuardedSamplingRate guarded_sampling_rate_;
+  ScopedProfileSamplingRate profile_sampling_rate_;
+};
+
+inline void UnregisterRseq() {
+#if TCMALLOC_INTERNAL_PERCPU_USE_RSEQ
+  syscall(__NR_rseq, &tcmalloc_internal::subtle::percpu::__rseq_abi,
+          sizeof(tcmalloc_internal::subtle::percpu::__rseq_abi),
+          tcmalloc_internal::subtle::percpu::kRseqUnregister,
+          TCMALLOC_PERCPU_RSEQ_SIGNATURE);
+#else
+  // rseq is is unavailable in this build
+  CHECK_CONDITION(false);
+#endif
+}
+
 // ScopedUnregisterRseq unregisters the current thread from rseq.  On
 // destruction, it reregisters it with IsFast().
 class ScopedUnregisterRseq {
@@ -95,15 +208,7 @@ class ScopedUnregisterRseq {
     // the destructor, verify that we can do so now.
     CHECK_CONDITION(tcmalloc_internal::subtle::percpu::IsFast());
 
-#if TCMALLOC_PERCPU_USE_RSEQ
-    syscall(__NR_rseq, &tcmalloc_internal::subtle::percpu::__rseq_abi,
-            sizeof(tcmalloc_internal::subtle::percpu::__rseq_abi),
-            tcmalloc_internal::subtle::percpu::kRseqUnregister,
-            TCMALLOC_PERCPU_RSEQ_SIGNATURE);
-#else
-    // rseq is is unavailable in this build
-    CHECK_CONDITION(false);
-#endif
+    UnregisterRseq();
 
     // Unregistering stores kCpuIdUninitialized to the cpu_id field.
     CHECK_CONDITION(tcmalloc_internal::subtle::percpu::RseqCpuId() ==
@@ -121,25 +226,51 @@ class ScopedUnregisterRseq {
 class ScopedFakeCpuId {
  public:
   explicit ScopedFakeCpuId(const int cpu_id) {
-#if TCMALLOC_PERCPU_USE_RSEQ
+#if TCMALLOC_INTERNAL_PERCPU_USE_RSEQ
     // Now that our unregister_rseq_ member has prevented the kernel from
     // modifying __rseq_abi, we can inject our own CPU ID.
     tcmalloc_internal::subtle::percpu::__rseq_abi.cpu_id = cpu_id;
+
+    if (tcmalloc_internal::subtle::percpu::UsingFlatVirtualCpus()) {
+      tcmalloc_internal::subtle::percpu::__rseq_abi.vcpu_id = cpu_id;
+    }
 #endif
   }
 
   ~ScopedFakeCpuId() {
-#if TCMALLOC_PERCPU_USE_RSEQ
+#if TCMALLOC_INTERNAL_PERCPU_USE_RSEQ
     // Undo the modification we made in the constructor, as required by
     // ~ScopedFakeCpuId.
     tcmalloc_internal::subtle::percpu::__rseq_abi.cpu_id =
         tcmalloc_internal::subtle::percpu::kCpuIdUninitialized;
+
+    if (tcmalloc_internal::subtle::percpu::UsingFlatVirtualCpus()) {
+      tcmalloc_internal::subtle::percpu::__rseq_abi.vcpu_id =
+          tcmalloc_internal::subtle::percpu::kCpuIdUninitialized;
+    }
 #endif
   }
 
  private:
 
   const ScopedUnregisterRseq unregister_rseq_;
+};
+
+// TODO(b/263387812): remove when experimentation is complete.
+// Temporarily enables or disables improved guarded sampling.
+class ScopedImprovedGuardedSampling {
+ public:
+  explicit ScopedImprovedGuardedSampling(bool is_enabled)
+      : previous_(MallocExtension::GetImprovedGuardedSampling()) {
+    MallocExtension::SetImprovedGuardedSampling(is_enabled);
+  }
+
+  ~ScopedImprovedGuardedSampling() {
+    MallocExtension::SetImprovedGuardedSampling(previous_);
+  }
+
+ private:
+  bool previous_;
 };
 
 // This pragma ensures that a loop does not get unrolled, in which case the

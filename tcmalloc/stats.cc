@@ -44,12 +44,8 @@ static double BytesToMiB(size_t bytes) {
   return bytes / MiB;
 }
 
-static double PagesToMiB(uint64_t pages) {
-  return BytesToMiB(pages * kPageSize);
-}
-
 // For example, PrintRightAdjustedWithPrefix(out, ">=", 42, 6) prints "  >=42".
-static void PrintRightAdjustedWithPrefix(Printer *out, const char *prefix,
+static void PrintRightAdjustedWithPrefix(Printer* out, const char* prefix,
                                          Length num, int width) {
   width -= strlen(prefix);
   int num_tmp = num.raw_num();
@@ -62,8 +58,8 @@ static void PrintRightAdjustedWithPrefix(Printer *out, const char *prefix,
   out->printf("%s%zu", prefix, num.raw_num());
 }
 
-void PrintStats(const char *label, Printer *out, const BackingStats &backing,
-                const SmallSpanStats &small, const LargeSpanStats &large,
+void PrintStats(const char* label, Printer* out, const BackingStats& backing,
+                const SmallSpanStats& small, const LargeSpanStats& large,
                 bool everything) {
   size_t nonempty_sizes = 0;
   for (int i = 0; i < kMaxPages.raw_num(); ++i) {
@@ -114,18 +110,18 @@ void PrintStats(const char *label, Printer *out, const BackingStats &backing,
 
 struct HistBucket {
   uint64_t min_sec;
-  const char *label;
+  const char* label;
 };
 
 static const HistBucket kSpanAgeHistBuckets[] = {
     // clang-format off
     {0, "<1s"},
-    {1, "1s"},
-    {30, "30s"},
-    {1 * 60, "1m"},
-    {30 * 60, "30m"},
-    {1 * 60 * 60, "1h"},
-    {8 * 60 * 60, "8+h"},
+    {1, "<30s"},
+    {30, "<1m"},
+    {1 * 60, "<30m"},
+    {30 * 60, "<1h"},
+    {1 * 60 * 60, "<8h"},
+    {8 * 60 * 60, ">=8h"},
     // clang-format on
 };
 
@@ -141,11 +137,11 @@ struct PageHeapEntry {
   int64_t released_age_hist_bytes[PageAgeHistograms::kNumBuckets] = {0, 0, 0, 0,
                                                                      0, 0, 0};
 
-  void PrintInPbtxt(PbtxtRegion *parent,
+  void PrintInPbtxt(PbtxtRegion* parent,
                     absl::string_view sub_region_name) const;
 };
 
-void PageHeapEntry::PrintInPbtxt(PbtxtRegion *parent,
+void PageHeapEntry::PrintInPbtxt(PbtxtRegion* parent,
                                  absl::string_view sub_region_name) const {
   auto page_heap = parent->CreateSubRegion(sub_region_name);
   page_heap.PrintI64("span_size", span_size);
@@ -175,9 +171,9 @@ void PageHeapEntry::PrintInPbtxt(PbtxtRegion *parent,
   }
 }
 
-void PrintStatsInPbtxt(PbtxtRegion *region, const SmallSpanStats &small,
-                       const LargeSpanStats &large,
-                       const PageAgeHistograms &ages) {
+void PrintStatsInPbtxt(PbtxtRegion* region, const SmallSpanStats& small,
+                       const LargeSpanStats& large,
+                       const PageAgeHistograms& ages) {
   // Print for small pages.
   for (auto i = Length(0); i < kMaxPages; ++i) {
     const size_t norm = small.normal_length[i.raw_num()];
@@ -275,7 +271,7 @@ void PageAgeHistograms::Histogram::Record(Length pages, double age) {
   total_age_ += pages.raw_num() * age;
 }
 
-void PageAgeHistograms::Print(const char *label, Printer *out) const {
+void PageAgeHistograms::Print(const char* label, Printer* out) const {
   out->printf("------------------------------------------------\n");
   out->printf(
       "%s cache entry age (count of pages in spans of "
@@ -295,7 +291,7 @@ void PageAgeHistograms::Print(const char *label, Printer *out) const {
   returned_.Print("Unmapped span", out);
 }
 
-static void PrintLineHeader(Printer *out, const char *kind, const char *prefix,
+static void PrintLineHeader(Printer* out, const char* kind, const char* prefix,
                             Length num) {
   // Print the beginning of the line, e.g. "Live span,   >=128 pages: ".  The
   // span size ("128" in the example) is padded such that it plus the span
@@ -308,13 +304,13 @@ static void PrintLineHeader(Printer *out, const char *kind, const char *prefix,
   out->printf(" pages: ");
 }
 
-void PageAgeHistograms::PerSizeHistograms::Print(const char *kind,
-                                                 Printer *out) const {
+void PageAgeHistograms::PerSizeHistograms::Print(const char* kind,
+                                                 Printer* out) const {
   out->printf("%-15s TOTAL PAGES: ", kind);
   total.Print(out);
 
   for (auto l = Length(1); l < Length(kNumSizes); ++l) {
-    const Histogram *here = &small[l.raw_num() - 1];
+    const Histogram* here = &small[l.raw_num() - 1];
     if (here->empty()) continue;
     PrintLineHeader(out, kind, "", l);
     here->Print(out);
@@ -326,17 +322,17 @@ void PageAgeHistograms::PerSizeHistograms::Print(const char *kind,
   }
 }
 
-void PageAgeHistograms::Histogram::Print(Printer *out) const {
+void PageAgeHistograms::Histogram::Print(Printer* out) const {
   const double mean = avg_age();
   out->printf(" %7.1f", mean);
   for (int b = 0; b < kNumBuckets; ++b) {
-    out->printf(" %7" PRIu32, buckets_[b]);
+    out->printf(" %7u", buckets_[b]);
   }
 
   out->printf("\n");
 }
 
-void PageAllocInfo::Print(Printer *out) const {
+void PageAllocInfo::Print(Printer* out) const {
   int64_t ticks = TimeTicks();
   double hz = freq_ / ticks;
   out->printf("%s: stats on allocation sizes\n", label_);
@@ -348,7 +344,7 @@ void PageAllocInfo::Print(Printer *out) const {
               largest_seen_.raw_num());
   out->printf("%s: per-size information:\n", label_);
 
-  auto print_counts = [this, hz, out](const Counts &c, Length nmin,
+  auto print_counts = [this, hz, out](const Counts& c, Length nmin,
                                       Length nmax) {
     const size_t a = c.nalloc;
     const size_t f = c.nfree;
@@ -367,7 +363,7 @@ void PageAllocInfo::Print(Printer *out) const {
     }
     out->printf(
         "%10zu / %10zu a/f, %8zu (%6.1f MiB) live, "
-        "%8.3g allocs/s (%6.1f MiB/s)\n",
+        "%8.3f allocs/s (%6.1f MiB/s)\n",
         a, f, live, live_mib, rate_hz, mib_hz);
   };
 
@@ -383,7 +379,7 @@ void PageAllocInfo::Print(Printer *out) const {
   }
 }
 
-void PageAllocInfo::PrintInPbtxt(PbtxtRegion *region,
+void PageAllocInfo::PrintInPbtxt(PbtxtRegion* region,
                                  absl::string_view stat_name) const {
   int64_t ticks = TimeTicks();
   double hz = freq_ / ticks;
@@ -391,7 +387,7 @@ void PageAllocInfo::PrintInPbtxt(PbtxtRegion *region,
   region->PrintI64("num_slack_pages", total_slack_.raw_num());
   region->PrintI64("largest_allocation_pages", largest_seen_.raw_num());
 
-  auto print_counts = [hz, region, &stat_name](const Counts &c, Length nmin,
+  auto print_counts = [hz, region, &stat_name](const Counts& c, Length nmin,
                                                Length nmax) {
     const size_t a = c.nalloc;
     const size_t f = c.nfree;
@@ -429,11 +425,6 @@ static Length RoundUp(Length value, Length alignment) {
 }
 
 void PageAllocInfo::RecordAlloc(PageId p, Length n) {
-  if (ABSL_PREDICT_FALSE(log_on())) {
-    int64_t t = TimeTicks();
-    LogAlloc(t, p, n);
-  }
-
   static_assert(kMaxPages.in_bytes() == 1024 * 1024, "threshold changed?");
   static_assert(kMaxPages < kPagesPerHugePage, "there should be slack");
   largest_seen_ = std::max(largest_seen_, n);
@@ -449,11 +440,6 @@ void PageAllocInfo::RecordAlloc(PageId p, Length n) {
 }
 
 void PageAllocInfo::RecordFree(PageId p, Length n) {
-  if (ABSL_PREDICT_FALSE(log_on())) {
-    int64_t t = TimeTicks();
-    LogFree(t, p, n);
-  }
-
   if (n <= kMaxPages) {
     total_small_ -= n;
     small_[n.raw_num() - 1].Free(n);
@@ -465,14 +451,9 @@ void PageAllocInfo::RecordFree(PageId p, Length n) {
   }
 }
 
-void PageAllocInfo::RecordRelease(Length n, Length got) {
-  if (ABSL_PREDICT_FALSE(log_on())) {
-    int64_t t = TimeTicks();
-    LogRelease(t, n);
-  }
-}
+void PageAllocInfo::RecordRelease(Length n, Length got) {}
 
-const PageAllocInfo::Counts &PageAllocInfo::counts_for(Length n) const {
+const PageAllocInfo::Counts& PageAllocInfo::counts_for(Length n) const {
   if (n <= kMaxPages) {
     return small_[n.raw_num() - 1];
   }
@@ -480,69 +461,7 @@ const PageAllocInfo::Counts &PageAllocInfo::counts_for(Length n) const {
   return large_[i];
 }
 
-// Our current format is really simple. We have an eight-byte version
-// number as a header (currently = 1). We then follow up with a sequence
-// of fixed-size events, each 16 bytes:
-// - 8 byte "id" (really returned page)
-// - 4 byte size (in kib, for compatibility)
-//   (this gets us to 4 TiB; anything larger is reported truncated)
-// - 4 bytes for when (ms since last event) + what
-// We shift up the when by 8 bits, and store what the event is in
-// low 8 bits. (Currently just 0=alloc, 1=free, 2=Release.)
-// This truncates time deltas to 2^24 ms ~= 4 hours.
-// This could be compressed further.  (As is, it compresses well
-// with gzip.)
-// All values are host-order.
-
-struct Entry {
-  uint64_t id;
-  uint32_t kib;
-  uint32_t whenwhat;
-};
-
-using tcmalloc::tcmalloc_internal::signal_safe_write;
-
-void PageAllocInfo::Write(uint64_t when, uint8_t what, PageId p, Length n) {
-  static_assert(sizeof(Entry) == 16, "bad sizing");
-  Entry e;
-  // Round the time to ms *before* computing deltas, because this produces more
-  // accurate results in the long run.
-
-  // Consider events that occur at absolute time 0.7ms and 50ms.  If
-  // we take deltas first, we say the first event occurred at +0.7 =
-  // 0ms and the second event occurred at +49.3ms = 49ms.
-  // Rounding first produces 0 and 50.
-  const uint64_t ms = when * 1000 / freq_;
-  uint64_t delta_ms = ms - last_ms_;
-  last_ms_ = ms;
-  // clamping
-  if (delta_ms >= 1 << 24) {
-    delta_ms = (1 << 24) - 1;
-  }
-  e.whenwhat = delta_ms << 8 | what;
-  e.id = p.index();
-  size_t bytes = n.in_bytes();
-  static const size_t KiB = 1024;
-  static const size_t kMaxRep = std::numeric_limits<uint32_t>::max() * KiB;
-  if (bytes > kMaxRep) {
-    bytes = kMaxRep;
-  }
-  e.kib = bytes / KiB;
-  const char *ptr = reinterpret_cast<const char *>(&e);
-  const size_t len = sizeof(Entry);
-  CHECK_CONDITION(len == signal_safe_write(fd_, ptr, len, nullptr));
-}
-
-PageAllocInfo::PageAllocInfo(const char *label, int log_fd)
-    : label_(label), fd_(log_fd) {
-  if (ABSL_PREDICT_FALSE(log_on())) {
-    // version 1 of the format, in case we change things up
-    uint64_t header = 1;
-    const char *ptr = reinterpret_cast<const char *>(&header);
-    const size_t len = sizeof(header);
-    CHECK_CONDITION(len == signal_safe_write(fd_, ptr, len, nullptr));
-  }
-}
+PageAllocInfo::PageAllocInfo(const char* label) : label_(label) {}
 
 int64_t PageAllocInfo::TimeTicks() const {
   return absl::base_internal::CycleClock::Now() - baseline_ticks_;

@@ -4,8 +4,9 @@ cmake_minimum_required( VERSION 3.21)
 include("cmake/HunterGate.cmake")
 
 HunterGate(
-    URL "https://github.com/cpp-pm/hunter/archive/v0.23.315.tar.gz"
-    SHA1 "ea5d72afc0df67f2126e7fd069f20c5f723709e1"
+    URL "https://github.com/cpp-pm/hunter/archive/v0.25.0.tar.gz"
+    SHA1 "a1296b351dbfaf036c92d85c1bdb461f615849fa"
+    LOCAL
 )
 
 project(tcmalloc LANGUAGES CXX ASM)
@@ -13,6 +14,7 @@ project(tcmalloc LANGUAGES CXX ASM)
 
 include(GNUInstallDirs)
 include("cmake/tcmalloc_cc_library.cmake")
+include("cmake/create_tcmalloc_libraries.cmake")
 
 # Check that this is not an in-source build:
 if("${PROJECT_SOURCE_DIR}" STREQUAL "${PROJECT_BINARY_DIR}")

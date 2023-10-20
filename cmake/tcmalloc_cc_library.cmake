@@ -153,7 +153,7 @@ function(tcmalloc_cc_library)
     )
     
     target_compile_options(${_realname}
-      PRIVATE ${TCMALLOC_DEFAULT_COPTS} ${TCMALLOC_CC_LIB_COPTS})
+      PRIVATE ${TCMALLOC_CC_LIB_COPTS})
     target_compile_definitions(${_realname} PUBLIC ${TCMALLOC_CC_LIB_DEFINES})
 
     # Add all Tcmalloc targets to a a folder in the IDE for organization.

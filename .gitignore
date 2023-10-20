@@ -1,2 +1,3 @@
 # Bazel
 bazel-*
+/build_clang17/**

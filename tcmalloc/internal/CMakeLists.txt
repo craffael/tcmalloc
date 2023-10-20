@@ -275,7 +275,7 @@ tcmalloc_cc_library(
     COPTS  ${TCMALLOC_DEFAULT_COPTS}    
     DEPS  
         "tcmalloc::logging"
-        ":mincore"
+        "tcmalloc::mincore"
         "tcmalloc::percpu"
         "tcmalloc::sysinfo"
         "absl::base"
@@ -383,8 +383,8 @@ tcmalloc_cc_library(
     
     DEPS  
         "tcmalloc::logging"
-        "@com_google_absl//absl/hash"
-        "@com_google_absl//absl/types:span"
+        "absl::hash"
+        "absl::span"
     
 )
 
